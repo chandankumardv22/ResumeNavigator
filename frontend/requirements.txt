@@ -1,0 +1,3 @@
+
+npm install axios chart.js react-chartjs-2
+npm install chart.js react-chartjs-2
