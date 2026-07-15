@@ -1,6 +1,14 @@
 import re
 from pdfminer.high_level import extract_text
-from docx import Document
+import importlib
+
+# Dynamically import `docx.Document` to avoid static-analysis errors when python-docx isn't installed
+Document = None
+try:
+    _docx = importlib.import_module("docx")
+    Document = getattr(_docx, "Document")
+except Exception:
+    Document = None
 
 
 # ---------------------------
@@ -34,6 +42,8 @@ def extract_resume_text(file_path):
         return normalize_utf8(extract_text(file_path))
 
     elif file_path.endswith(".docx"):
+        if Document is None:
+            return ""
         doc = Document(file_path)
         return normalize_utf8("\n".join([para.text for para in doc.paragraphs]))
 

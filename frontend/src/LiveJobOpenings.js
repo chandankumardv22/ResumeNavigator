@@ -8,6 +8,7 @@ function normalizeJob(job) {
     location: job.location || 'India',
     redirect_url: job.redirect_url || job.job_apply_link || job.link || '#',
     job_employment_type: job.job_employment_type || job.type || 'Full-time',
+    source: job.source || 'Verified provider',
   };
 }
 
@@ -29,6 +30,7 @@ function JobCard({ job, index }) {
       <div className="job-card__tags">
         <span className="job-card__tag">{j.location}</span>
         <span className="job-card__tag">{j.job_employment_type}</span>
+        <span className="job-card__tag">{j.source}</span>
       </div>
       <div className="job-card__footer job-card__footer--apply">
         {canApply ? (
@@ -67,6 +69,7 @@ function RoleJobGroup({ roleName, jobs }) {
 
 export default function LiveJobOpenings({
   recommendedRoles,
+  matchedSkills = [],
   jobsByRole,
   jobsMessage,
   jobsCount,
@@ -80,16 +83,26 @@ export default function LiveJobOpenings({
     (sum, list) => sum + (list?.length || 0),
     0,
   );
+  const searchTerms = [...new Set((matchedSkills || []).filter(Boolean))].slice(0, 6).join(' ');
+  const platformLinks = [
+    ['LinkedIn', `https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(searchTerms)}&location=India`],
+    ['Naukri', `https://www.naukri.com/${encodeURIComponent(searchTerms).replace(/%20/g, '-')}-jobs-in-india`],
+    ['Indeed', `https://in.indeed.com/jobs?q=${encodeURIComponent(searchTerms)}&l=India`],
+  ];
 
   return (
     <section className="live-jobs-panel" id="live-jobs">
       <div className="live-jobs-panel__header">
-        <h3 className="live-jobs-panel__title">Live Job Openings (India)</h3>
+        <h3 className="live-jobs-panel__title">Skill-matched job openings</h3>
         <p className="live-jobs-panel__sub">
           {totalJobs > 0
             ? `${totalJobs} active openings across your recommended roles`
             : 'Real-time India job search'}
         </p>
+        {searchTerms && <p className="live-jobs-panel__sub">Search query derived from your resume: <strong>{searchTerms}</strong></p>}
+        <div className="job-platform-links">
+          {platformLinks.map(([name, href]) => <a key={name} href={href} target="_blank" rel="noopener noreferrer">Search {name}</a>)}
+        </div>
         {loading && (
           <p className="live-jobs-panel__notice live-jobs-panel__notice--loading" role="status">
             Fetching live India job openings for your roles…

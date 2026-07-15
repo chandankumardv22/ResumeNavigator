@@ -158,4 +158,4 @@ If you found this project useful, consider giving it a ⭐ on GitHub!
 ---
 git add README.md
 git commit -m "Finalized README with structured tables and formatting"
-git push origin main
+git push origin main# ResumeNavigator

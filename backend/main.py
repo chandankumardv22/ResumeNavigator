@@ -34,20 +34,24 @@ from fastapi.responses import JSONResponse
 from google import genai
 from google.genai import types
 from pathlib import Path
-from pdf_parser import extract_pdf_text
 from pydantic import BaseModel, Field
 
-from skills import (
-    DOMAIN_PROFILES,
-    _NON_RESUME_SIGNALS,
-    _RESUME_SIGNALS,
-    compute_missing_skills,
-    detect_domain,
-    extract_professional_skills,
-    infer_roles_from_skills,
-    merge_recommended_roles,
-    sanitize_skills,
-)
+# Support both `uvicorn backend.main:app` (package mode) and the existing
+# quick-start launcher, which runs `uvicorn main:app` from backend/.
+try:
+    from .pdf_parser import extract_pdf_text
+    from .skills import (
+        DOMAIN_PROFILES, _NON_RESUME_SIGNALS, _RESUME_SIGNALS,
+        compute_missing_skills, detect_domain, extract_professional_skills,
+        infer_roles_from_skills, merge_recommended_roles, sanitize_skills,
+    )
+except ImportError:  # pragma: no cover - used only when launched from backend/
+    from pdf_parser import extract_pdf_text
+    from skills import (
+        DOMAIN_PROFILES, _NON_RESUME_SIGNALS, _RESUME_SIGNALS,
+        compute_missing_skills, detect_domain, extract_professional_skills,
+        infer_roles_from_skills, merge_recommended_roles, sanitize_skills,
+    )
 
 _BACKEND_DIR = Path(__file__).resolve().parent
 load_dotenv(_BACKEND_DIR / ".env")
@@ -141,6 +145,16 @@ class FetchJobsRequest(BaseModel):
     recommended_roles: list[str] = Field(default_factory=list)
 
 
+class ResumeTextRequest(BaseModel):
+    """Used by interactive intelligence tools after a resume has been parsed."""
+    resume_text: str = Field(min_length=35, max_length=50000)
+    target_role: str | None = Field(default=None, max_length=120)
+
+
+class JobMatchRequest(ResumeTextRequest):
+    job_description: str = Field(min_length=35, max_length=50000)
+
+
 def _normalize_resume_text(text: str) -> str:
     if not text:
         return ""
@@ -154,6 +168,7 @@ def _job_record(
     location: str,
     redirect_url: str,
     employment_type: str = "Full-time",
+    source: str = "Job provider",
 ) -> dict[str, Any]:
     url = redirect_url or "#"
     return {
@@ -165,6 +180,7 @@ def _job_record(
         "employer_name": company_name,
         "job_apply_link": url,
         "job_employment_type": employment_type,
+        "source": source,
     }
 
 
@@ -178,10 +194,11 @@ def jobs_provider_status() -> dict[str, Any]:
     }
 
 
-def fetch_jsearch_jobs(role_category: str, limit: int = JOBS_PER_ROLE) -> list[dict[str, Any]]:
+def fetch_jsearch_jobs(role_category: str, skills: list[str] | None = None, limit: int = JOBS_PER_ROLE) -> list[dict[str, Any]]:
     if not _is_real_key(RAPIDAPI_KEY):
         return []
-    query = f"{role_category} in India"
+    skill_query = " ".join((skills or [])[:4])
+    query = f"{role_category} {skill_query} in India".strip()
     out: list[dict[str, Any]] = []
     try:
         r = requests.get(
@@ -213,6 +230,7 @@ def fetch_jsearch_jobs(role_category: str, limit: int = JOBS_PER_ROLE) -> list[d
                     location=loc,
                     redirect_url=j.get("job_apply_link") or j.get("job_google_link") or "#",
                     employment_type=j.get("job_employment_type") or "Full-time",
+                    source="JSearch",
                 )
             )
     except Exception as exc:
@@ -220,7 +238,7 @@ def fetch_jsearch_jobs(role_category: str, limit: int = JOBS_PER_ROLE) -> list[d
     return out[:limit]
 
 
-def fetch_adzuna_jobs(role_category: str, limit: int = JOBS_PER_ROLE) -> list[dict[str, Any]]:
+def fetch_adzuna_jobs(role_category: str, skills: list[str] | None = None, limit: int = JOBS_PER_ROLE) -> list[dict[str, Any]]:
     if not (_is_real_key(ADZUNA_APP_ID) and _is_real_key(ADZUNA_APP_KEY)):
         return []
     out: list[dict[str, Any]] = []
@@ -230,7 +248,7 @@ def fetch_adzuna_jobs(role_category: str, limit: int = JOBS_PER_ROLE) -> list[di
             params={
                 "app_id": ADZUNA_APP_ID,
                 "app_key": ADZUNA_APP_KEY,
-                "what": role_category,
+                "what": f"{role_category} {' '.join((skills or [])[:4])}",
                 "results_per_page": limit,
             },
             timeout=JOB_API_TIMEOUT,
@@ -250,6 +268,7 @@ def fetch_adzuna_jobs(role_category: str, limit: int = JOBS_PER_ROLE) -> list[di
                     location=loc,
                     redirect_url=j.get("redirect_url") or "#",
                     employment_type=j.get("contract_type") or "Full-time",
+                    source="Adzuna",
                 )
             )
     except Exception as exc:
@@ -257,13 +276,13 @@ def fetch_adzuna_jobs(role_category: str, limit: int = JOBS_PER_ROLE) -> list[di
     return out[:limit]
 
 
-def fetch_india_jobs_for_role(role_category: str, limit: int = JOBS_PER_ROLE) -> list[dict[str, Any]]:
+def fetch_india_jobs_for_role(role_category: str, skills: list[str] | None = None, limit: int = JOBS_PER_ROLE) -> list[dict[str, Any]]:
     seen: set[str] = set()
     merged: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = [
-            pool.submit(fetch_jsearch_jobs, role_category, limit),
-            pool.submit(fetch_adzuna_jobs, role_category, limit),
+            pool.submit(fetch_jsearch_jobs, role_category, skills, limit),
+            pool.submit(fetch_adzuna_jobs, role_category, skills, limit),
         ]
         for future in as_completed(futures):
             for job in future.result():
@@ -279,6 +298,7 @@ def fetch_india_jobs_for_role(role_category: str, limit: int = JOBS_PER_ROLE) ->
 
 def fetch_jobs_for_roles(
     roles: list[str],
+    skills: list[str] | None = None,
     per_role_limit: int = JOBS_PER_ROLE,
 ) -> dict[str, list[dict[str, Any]]]:
     role_names = [str(role).strip() for role in roles if str(role).strip()][:MAX_JOB_ROLES]
@@ -287,7 +307,7 @@ def fetch_jobs_for_roles(
     grouped: dict[str, list[dict[str, Any]]] = {}
     with ThreadPoolExecutor(max_workers=min(len(role_names), 5)) as pool:
         futures = {
-            pool.submit(fetch_india_jobs_for_role, role_name, per_role_limit): role_name
+            pool.submit(fetch_india_jobs_for_role, role_name, skills, per_role_limit): role_name
             for role_name in role_names
         }
         for future in as_completed(futures):
@@ -329,6 +349,146 @@ def _heuristic_is_resume(text: str) -> bool:
     return False
 
 
+def _build_scorecard(
+    resume_text: str, matched_skills: list[str], missing_skills: list[str], domain: str
+) -> dict[str, Any]:
+    """Return a reproducible, evidence-based ATS score instead of a random number.
+
+    This intentionally evaluates only signals that are observable in the uploaded text.
+    It is a screening-readiness indicator, not a promise of a hiring outcome.
+    """
+    lower = resume_text.lower()
+    words = re.findall(r"\b[\w+#./-]+\b", resume_text)
+    lines = [line.strip() for line in resume_text.splitlines() if line.strip()]
+    profile = DOMAIN_PROFILES.get(domain, {})
+    skill_pool = profile.get("skill_pool", [])
+    has = lambda terms: any(term in lower for term in terms)
+    skill_coverage = min(1.0, len(matched_skills) / max(5, min(12, len(skill_pool))))
+    quantified = len(re.findall(r"\b\d+(?:[.,]\d+)?\s*(?:%|x|users|customers|projects|days|hours|lakhs|crore)\b", lower))
+    action_verbs = len(re.findall(r"\b(built|led|created|delivered|improved|designed|developed|managed|launched|optimized|implemented|automated|analyzed)\b", lower))
+    sections = sum(has([name]) for name in ("summary", "experience", "education", "skills", "project", "certification", "achievement"))
+    bullets = sum(1 for line in lines if re.match(r"^(?:[-•*]|\d+[.)])\s+", line))
+    sentence_lengths = [len(re.findall(r"\w+", s)) for s in re.split(r"[.!?\n]+", resume_text) if s.strip()]
+    avg_sentence = sum(sentence_lengths) / max(1, len(sentence_lengths))
+    readability = max(0, min(100, round(88 - max(0, avg_sentence - 18) * 2.2 - (8 if len(words) < 180 else 0))))
+    values = {
+        "Formatting": min(100, 35 + sections * 8 + min(12, bullets)),
+        "Technical skills": round(25 + skill_coverage * 75),
+        "Experience": min(100, 30 + (28 if has(["experience", "employment", "work history", "internship"]) else 0) + min(24, quantified * 6 + action_verbs * 2)),
+        "Projects": min(100, 25 + (35 if has(["projects", "project"]) else 0) + min(30, quantified * 5 + action_verbs * 2)),
+        "Education": 82 if has(["education", "university", "college", "b.tech", "b.e", "b.sc", "b.com", "mba"]) else 30,
+        "Achievements": min(100, 25 + (30 if has(["achievement", "award", "winner", "certification"]) else 0) + min(25, quantified * 5)),
+        "Readability": readability,
+        "Recruiter impression": min(100, 28 + sections * 7 + min(28, action_verbs * 3 + quantified * 4) + round(skill_coverage * 16)),
+    }
+    weights = {"Formatting": .12, "Technical skills": .22, "Experience": .18, "Projects": .14, "Education": .08, "Achievements": .08, "Readability": .08, "Recruiter impression": .10}
+    overall = round(sum(values[key] * weights[key] for key in values))
+    evidence = [
+        f"{len(matched_skills)} relevant skills mapped to the {domain} profile",
+        f"{sections}/7 core resume sections detected",
+        f"{action_verbs} action verbs and {quantified} quantified outcomes detected",
+    ]
+    if missing_skills:
+        evidence.append("Priority gaps: " + ", ".join(missing_skills[:3]))
+    return {"overall": max(0, min(100, overall)), "sections": values, "evidence": evidence}
+
+
+def _extract_resume_sections(resume_text: str) -> dict[str, str]:
+    """Split common resume sections without assuming a rigid template."""
+    aliases = {
+        "summary": ("summary", "profile", "objective", "about me"),
+        "experience": ("experience", "work history", "employment", "internship"),
+        "education": ("education", "academic background", "qualification"),
+        "skills": ("skills", "technical skills", "core competencies"),
+        "projects": ("projects", "academic projects", "personal projects"),
+        "achievements": ("achievements", "awards", "certifications", "certificates"),
+    }
+    result = {name: "" for name in aliases}
+    current: str | None = None
+    for line in resume_text.splitlines():
+        clean = line.strip()
+        compact = clean.lower().rstrip(":")
+        found = next((name for name, names in aliases.items() if compact in names), None)
+        if found:
+            current = found
+        elif current and clean:
+            result[current] += ("\n" if result[current] else "") + clean
+    return result
+
+
+def _build_career_intelligence(
+    resume_text: str, matched: list[str], missing: list[str], domain: str, scorecard: dict[str, Any]
+) -> dict[str, Any]:
+    """Create UI-ready intelligence from measured document signals.
+
+    Labels deliberately describe readiness/attention rather than claiming to predict a
+    particular hiring decision. Hiring outcomes require data the resume cannot provide.
+    """
+    sections = _extract_resume_sections(resume_text)
+    score_sections = scorecard.get("sections", {})
+    attention = []
+    section_score_key = {"summary": "Recruiter impression", "experience": "Experience", "education": "Education", "skills": "Technical skills", "projects": "Projects", "achievements": "Achievements"}
+    for name, content in sections.items():
+        if not content:
+            status, reason = "low", "No clearly labeled section was detected."
+        else:
+            value = score_sections.get(section_score_key[name], 0)
+            status = "high" if value >= 70 else "medium" if value >= 45 else "low"
+            reason = f"{len(content.split())} extractable words; {section_score_key[name].lower()} signal is {value}/100."
+        attention.append({"section": name.title(), "attention": status, "reason": reason})
+
+    lower = resume_text.lower()
+    years = sorted(set(re.findall(r"\b(?:19|20)\d{2}\b", lower)))
+    timeline = []
+    for year in years[:12]:
+        context = next((line.strip() for line in resume_text.splitlines() if year in line), year)
+        timeline.append({"year": year, "event": context[:180]})
+    action_count = len(re.findall(r"\b(built|led|created|delivered|improved|designed|developed|managed|launched|optimized|implemented|automated|analyzed)\b", lower))
+    quantified = len(re.findall(r"\b\d+(?:[.,]\d+)?\s*(?:%|x|users|customers|projects|days|hours|lakhs|crore)\b", lower))
+    question_skills = matched[:5] or missing[:3]
+    interview = [{"type": "Technical", "question": f"Walk me through a project where you used {skill}.", "why": "This skill was detected in the resume."} for skill in question_skills]
+    interview += [
+        {"type": "Behavioral", "question": "Tell me about an outcome you improved and how you measured it.", "why": "Recruiters look for measurable ownership."},
+        {"type": "HR", "question": "Why is this target role the right next step for you?", "why": "Tests the clarity of your career narrative."},
+    ]
+    readiness = scorecard.get("overall", 0)
+    return {
+        "recruiter_simulation": {
+            "first_ten_second_read": "clear" if readiness >= 70 else "mixed" if readiness >= 50 else "unclear",
+            "summary": f"The first scan finds {len(matched)} relevant skills, {action_count} action verbs, and {quantified} quantified outcomes.",
+            "attention_map": attention,
+        },
+        "resume_heatmap": attention,
+        "career_dna": {
+            "best_domains": [domain],
+            "leadership_signal": min(100, 25 + action_count * 5),
+            "innovation_signal": min(100, 20 + (18 if sections["projects"] else 0) + action_count * 3),
+            "communication_signal": score_sections.get("Readability", 0),
+            "learning_signal": min(100, 25 + len(matched) * 5 + (15 if sections["achievements"] else 0)),
+            "note": "Signals are based on written evidence in this resume, not personality inference.",
+        },
+        "interview_predictor": interview,
+        "resume_timeline": timeline,
+        "confidence_meter": {
+            "readiness_score": readiness,
+            "label": "Application readiness—not a selection or offer probability.",
+            "next_action": "Address the highest-value skill gaps and add measurable outcomes before applying." if missing else "Tailor the resume to each job description before applying.",
+        },
+    }
+
+
+def _analyze_text_intelligence(resume_text: str) -> dict[str, Any]:
+    text = _normalize_resume_text(resume_text)
+    if not _heuristic_is_resume(text):
+        raise HTTPException(status_code=422, detail=INVALID_RESUME_ERROR)
+    domain = detect_domain(text)
+    metadata = _extract_candidate_details(text)
+    matched = sanitize_skills(extract_professional_skills(text, domain), metadata)
+    missing = compute_missing_skills(matched, domain)
+    scorecard = _build_scorecard(text, matched, missing, domain)
+    return {"domain": domain, "matched_skills": matched, "missing_skills": missing, "scorecard": scorecard, "intelligence": _build_career_intelligence(text, matched, missing, domain, scorecard)}
+
+
 def _build_domain_analysis(resume_text: str) -> dict[str, Any]:
     if not _heuristic_is_resume(resume_text):
         return {"error": INVALID_RESUME_ERROR}
@@ -363,9 +523,8 @@ def _build_domain_analysis(resume_text: str) -> dict[str, Any]:
         limit=6,
     )
 
-    skill_pool = list(profile["skill_pool"])
-    coverage = len(matched) / max(1, len(skill_pool))
-    ats_score = int(max(30, min(92, round(38 + coverage * 52))))
+    scorecard = _build_scorecard(text, matched, missing, domain)
+    ats_score = scorecard["overall"]
 
     if domain == "General / Fresher" or any(k in lower for k in ("fresher", "intern", "trainee", "graduate")):
         roadmap = [
@@ -436,6 +595,7 @@ def _build_domain_analysis(resume_text: str) -> dict[str, Any]:
         "learning_roadmap": roadmap,
         "custom_suggestion": suggestion,
         "career_suggestions": career_suggestions,
+        "scorecard": scorecard,
     }
 
 
@@ -644,8 +804,9 @@ def _extract_candidate_details(resume_text: str) -> dict[str, str]:
     }
 
 
-def _build_jobs_payload(recommended_roles: list[str]) -> dict[str, Any]:
-    jobs_by_role = fetch_jobs_for_roles(recommended_roles, JOBS_PER_ROLE)
+def _build_jobs_payload(recommended_roles: list[str], matched_skills: list[str] | None = None) -> dict[str, Any]:
+    skills = [str(skill).strip() for skill in (matched_skills or []) if str(skill).strip()][:8]
+    jobs_by_role = fetch_jobs_for_roles(recommended_roles, skills, JOBS_PER_ROLE)
     total = sum(len(v) for v in jobs_by_role.values())
     provider = jobs_provider_status()
     message = None
@@ -659,6 +820,7 @@ def _build_jobs_payload(recommended_roles: list[str]) -> dict[str, Any]:
         "jobs_count": total,
         "jobs_provider": provider,
         "jobs_message": message,
+        "job_search_skills": skills,
     }
 
 
@@ -694,6 +856,39 @@ def api_fetch_jobs(body: FetchJobsRequest):
         raise HTTPException(status_code=400, detail="recommended_roles must be a non-empty list.")
     payload = _build_jobs_payload(roles)
     return {"recommended_roles": roles, **payload}
+
+
+@app.post("/api/intelligence")
+def career_intelligence(body: ResumeTextRequest):
+    """Return recruiter simulation, heatmap, career DNA, interview prompts and timeline."""
+    return _analyze_text_intelligence(body.resume_text)
+
+
+@app.post("/api/job-match")
+def job_match(body: JobMatchRequest):
+    """Explain a resume-to-job match using normalized skills and document evidence."""
+    analysis = _analyze_text_intelligence(body.resume_text)
+    jd = _normalize_resume_text(body.job_description)
+    jd_domain = detect_domain(jd)
+    jd_skills = sanitize_skills(extract_professional_skills(jd, jd_domain), {})
+    resume_lower = body.resume_text.lower()
+    matched = [skill for skill in jd_skills if skill.lower() in resume_lower]
+    missing = [skill for skill in jd_skills if skill not in matched]
+    skill_score = round(100 * len(matched) / max(1, len(jd_skills)))
+    relevance_bonus = 10 if analysis["domain"] == jd_domain else 0
+    match_score = min(100, round(skill_score * .75 + analysis["scorecard"]["sections"].get("Readability", 0) * .15 + relevance_bonus))
+    return {
+        "target_role": body.target_role or "Target role",
+        "match_score": match_score,
+        "score_explanation": [
+            f"{len(matched)} of {len(jd_skills)} skills extracted from the job description are evidenced in the resume.",
+            f"Resume domain: {analysis['domain']}; job-description domain: {jd_domain}.",
+            "Score combines skill coverage, readability, and domain alignment; it is not a hiring prediction.",
+        ],
+        "matched_skills": matched,
+        "missing_skills": missing,
+        "resume_scorecard": analysis["scorecard"],
+    }
 
 
 async def _analyze_impl(file: UploadFile) -> dict[str, Any]:
@@ -750,7 +945,12 @@ async def _analyze_impl(file: UploadFile) -> dict[str, Any]:
         )
         if not missing:
             missing = compute_missing_skills(matched, domain)
-        jobs_payload = _build_jobs_payload(recommended_roles)
+        # The final score is always generated from observable resume signals so it
+        # remains explainable even when an LLM is enabled for narrative analysis.
+        scorecard = _build_scorecard(text, matched, missing, domain)
+        ats = scorecard["overall"]
+        intelligence = _build_career_intelligence(text, matched, missing, domain, scorecard)
+        jobs_payload = _build_jobs_payload(recommended_roles, matched)
 
         return {
             "ats_score": ats,
@@ -768,6 +968,8 @@ async def _analyze_impl(file: UploadFile) -> dict[str, Any]:
             "candidate_email": details.get("candidate_email", "Not found"),
             "candidate_phone": details.get("candidate_phone", "Not found"),
             "candidate_college": details.get("candidate_college", "Not found"),
+            "scorecard": scorecard,
+            "career_intelligence": intelligence,
             **jobs_payload,
         }
     except HTTPException:

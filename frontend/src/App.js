@@ -1,475 +1,87 @@
-import React, { useState, useCallback, useMemo } from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
 import { useDropzone } from 'react-dropzone';
 import axios from 'axios';
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
-import {
-  Upload,
-  FileSearch,
-  FileText,
-  Target,
-  Briefcase,
-  CheckCircle2,
-  Loader2,
-  ClipboardList,
-} from 'lucide-react';
+import { Activity, ArrowUpRight, BrainCircuit, BriefcaseBusiness, Check, ChevronRight, Download, FileSearch, Gauge, Loader2, Radar, Sparkles, Target, Upload, Zap } from 'lucide-react';
 import LiveJobOpenings from './LiveJobOpenings';
 import './App.css';
 
-function getApiOrigin() {
-  const raw = process.env.REACT_APP_API_URL;
-  if (raw != null && String(raw).trim() !== '') {
-    return String(raw).trim().replace(/\/$/, '');
-  }
-  return 'http://127.0.0.1:8000';
+const api = (process.env.REACT_APP_API_URL || 'http://127.0.0.1:8000').replace(/\/$/, '');
+const errorMessage = (error) => error.response?.data?.error || error.response?.data?.detail || error.message || 'Analysis could not be completed.';
+
+function downloadCareerReport(data) {
+  const doc = new jsPDF({ unit: 'pt', format: 'a4' });
+  const scorecard = data.scorecard || { overall: data.ats_score || 0, sections: {}, evidence: [] };
+  const intelligence = data.career_intelligence || {};
+  const margin = 42; const width = doc.internal.pageSize.getWidth() - margin * 2;
+  let y = 52;
+  const addHeader = () => { doc.setFillColor(16, 20, 29); doc.rect(0, 0, doc.internal.pageSize.getWidth(), 28, 'F'); doc.setTextColor(255, 255, 255); doc.setFont('helvetica', 'bold'); doc.setFontSize(9); doc.text('RESUMENAVIGATOR  /  CAREER INTELLIGENCE REPORT', margin, 18); doc.setTextColor(16, 20, 29); };
+  const addTitle = (title, subtitle = '') => { if (y > 700) { doc.addPage(); addHeader(); y = 54; } doc.setFont('helvetica', 'bold'); doc.setFontSize(16); doc.setTextColor(16, 20, 29); doc.text(title, margin, y); y += 17; if (subtitle) { doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(92, 99, 112); const lines = doc.splitTextToSize(subtitle, width); doc.text(lines, margin, y); y += lines.length * 12 + 9; } };
+  const table = (head, body, columnStyles = {}) => { autoTable(doc, { startY: y, margin: { left: margin, right: margin }, head: [head], body, styles: { font: 'helvetica', fontSize: 8, cellPadding: 6, textColor: [40, 44, 54], overflow: 'linebreak' }, headStyles: { fillColor: [108, 91, 218], textColor: 255, fontStyle: 'bold' }, alternateRowStyles: { fillColor: [247, 246, 252] }, columnStyles, didDrawCell: (hook) => { if (hook.section === 'body' && hook.column.index === 4) { const url = String(hook.cell.raw || ''); if (url.startsWith('http')) doc.link(hook.cell.x, hook.cell.y, hook.cell.width, hook.cell.height, { url }); } }, didDrawPage: () => addHeader() }); y = doc.lastAutoTable.finalY + 22; };
+  const jobs = Object.entries(data.jobs_by_role || {}).flatMap(([role, list]) => (list || []).map(job => [role, job.job_title || job.title || 'Open role', job.company_name || job.employer_name || 'Hiring company', job.location || 'India', job.redirect_url || job.job_apply_link || '']));
+  addHeader();
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(27); doc.text('Career Intelligence', margin, y); y += 30; doc.setTextColor(108, 91, 218); doc.text('REPORT', margin, y); y += 28; doc.setTextColor(16, 20, 29); doc.setFontSize(11); doc.setFont('helvetica', 'normal'); doc.text(`${data.candidate_name || 'Candidate'}  |  ${data.detected_domain || 'Career profile'}  |  ${new Date().toLocaleDateString()}`, margin, y); y += 35;
+  table(['Overall ATS readiness', 'Target role', 'Recommended roles'], [[`${scorecard.overall}/100`, data.predicted_role || 'Not identified', (data.recommended_roles || []).join(', ') || 'Not identified']]);
+  addTitle('Profile and analysis summary', data.career_suggestions || data.custom_suggestion || 'No narrative summary was generated.');
+  table(['Candidate', 'Email', 'College'], [[data.candidate_name || 'Not found', data.candidate_email || 'Not found', data.candidate_college || 'Not found']]);
+  addTitle('Explainability', 'Each score below is produced from evidence detected in the uploaded resume.');
+  table(['Score dimension', 'Score'], Object.entries(scorecard.sections || {}).map(([name, value]) => [name, `${value}/100`]));
+  table(['Evidence'], (scorecard.evidence || []).map(item => [item]));
+  addTitle('Capability map', 'Strengths are extracted from your resume. Growth edges are role-profile gaps identified from the same analysis.');
+  table(['Confirmed strengths', 'Priority growth edges'], [[(data.matched_skills || []).join(', ') || 'None reliably extracted', (data.missing_skills || []).join(', ') || 'No major gaps identified']]);
+  addTitle('Growth simulator', 'A practical, resume-aligned 90-day progression.');
+  table(['Step', 'Focus', 'Project or proof point'], (data.learning_roadmap || []).map(step => [step.title || `Step ${step.step}`, step.focus || '', step.project_idea || '']));
+  if (intelligence.recruiter_simulation) { addTitle('Recruiter simulation', intelligence.recruiter_simulation.summary || ''); table(['Resume section', 'Attention', 'Reason'], (intelligence.recruiter_simulation.attention_map || []).map(item => [item.section, item.attention, item.reason])); }
+  if (intelligence.career_dna) { addTitle('Career evidence signals', intelligence.career_dna.note || ''); table(['Signal', 'Evidence score'], [['Leadership', `${intelligence.career_dna.leadership_signal}/100`], ['Innovation', `${intelligence.career_dna.innovation_signal}/100`], ['Communication', `${intelligence.career_dna.communication_signal}/100`], ['Learning', `${intelligence.career_dna.learning_signal}/100`]]); }
+  if ((intelligence.interview_predictor || []).length) { addTitle('Interview preparation', 'Questions are generated from detected skills and resume evidence.'); table(['Type', 'Question', 'Why it matters'], intelligence.interview_predictor.map(item => [item.type, item.question, item.why])); }
+  if ((intelligence.resume_timeline || []).length) { addTitle('Resume timeline'); table(['Year', 'Extracted event'], intelligence.resume_timeline.map(item => [item.year, item.event])); }
+  addTitle('Job opportunities and application links', 'Listings are queried with the role and skills detected in this resume. Select any URL below to apply.');
+  if (jobs.length) { table(['Role', 'Job title', 'Company', 'Location', 'Apply URL'], jobs, { 4: { cellWidth: 130, textColor: [79, 70, 229] } }); } else { table(['Status'], [['No verified provider listings were available at report time. Use the skill-specific LinkedIn, Naukri, and Indeed searches in the dashboard.']]); }
+  const pageCount = doc.internal.getNumberOfPages();
+  for (let page = 1; page <= pageCount; page += 1) { doc.setPage(page); doc.setFont('helvetica', 'normal'); doc.setFontSize(8); doc.setTextColor(110, 114, 126); doc.text(`ResumeNavigator - confidential career intelligence report - page ${page} of ${pageCount}`, margin, doc.internal.pageSize.getHeight() - 24); }
+  doc.save('ResumeNavigator-Career-Intelligence-Report.pdf');
 }
 
-function getAnalyzeUrl() {
-  return `${getApiOrigin()}/analyze`;
+function ScoreRing({ score }) {
+  const radius = 62; const length = 2 * Math.PI * radius;
+  return <div className="score-ring"><svg viewBox="0 0 144 144"><circle className="ring-track" cx="72" cy="72" r={radius}/><circle className="ring-value" cx="72" cy="72" r={radius} style={{ strokeDasharray: length, strokeDashoffset: length * (1 - score / 100) }}/></svg><div><strong>{score}</strong><span>/100</span><p>ATS readiness</p></div></div>;
 }
 
-function formatApiError(err) {
-  const data = err.response?.data;
-  if (data?.error) return data.error;
-  if (data?.detail?.error) return data.detail.error;
-  if (typeof data?.detail === 'string') return data.detail;
-  if (Array.isArray(data?.detail)) {
-    const joined = data.detail
-      .map((x) => (typeof x === 'string' ? x : x?.msg))
-      .filter(Boolean)
-      .join('; ');
-    if (joined) return joined;
-  }
-  if (data?.message) return data.message;
-  if (err.response?.status) return `Request failed with status code ${err.response.status}`;
-  return err.message || 'Analysis failed. Please try again.';
+function UploadPanel({ file, setFile, loading, analyze }) {
+  const onDrop = useCallback((accepted) => accepted[0] && setFile(accepted[0]), [setFile]);
+  const { getRootProps, getInputProps, isDragActive } = useDropzone({ onDrop, accept: { 'application/pdf': ['.pdf'] }, maxFiles: 1, disabled: loading });
+  return <section className="upload-panel" id="analyze"><div {...getRootProps()} className={`dropzone ${isDragActive ? 'active' : ''} ${file ? 'ready' : ''}`}><input {...getInputProps()}/><div className="drop-icon"><Upload size={24}/></div><div><strong>{file ? file.name : 'Drop your resume here'}</strong><p>{file ? `${Math.ceil(file.size / 1024)} KB · ready to scan` : 'PDF files only · your document stays private'}</p></div><ChevronRight className="drop-arrow"/></div><button className="primary-button" disabled={!file || loading} onClick={analyze}>{loading ? <><Loader2 className="spin" size={18}/> Building intelligence brief</> : <><Sparkles size={18}/> Analyze my resume</>}</button></section>;
 }
 
-function Header() {
-  return (
-    <header className="pf-header glass-panel">
-      <div className="pf-header__inner">
-        <span className="pf-gradient-text pf-header__brand">PathFinder</span>
-        <nav className="pf-header__nav">
-          <a href="#upload">Upload</a>
-          <a href="#timeline">Process</a>
-          <a href="#dashboard">Results</a>
-        </nav>
-      </div>
-    </header>
-  );
-}
-
-function ValueProps() {
-  const items = [
-    {
-      icon: Target,
-      title: 'ATS Scoring',
-      text: 'Domain-aware scoring calibrated to your actual resume content.',
-    },
-    {
-      icon: ClipboardList,
-      title: 'Skill Precision',
-      text: 'Professional competencies extracted without contact metadata noise.',
-    },
-    {
-      icon: Briefcase,
-      title: 'Live Job Matches',
-      text: 'Curated India openings mapped to your recommended career roles.',
-    },
+function CareerAnalysisAnimation() {
+  const stages = [
+    ['Resume scan', FileSearch],
+    ['Skill signals', Sparkles],
+    ['Role alignment', Target],
+    ['Opportunity map', BriefcaseBusiness],
   ];
-  return (
-    <div className="pf-value-grid">
-      {items.map((item) => {
-        const Icon = item.icon;
-        return (
-          <article key={item.title} className="pf-value-card glass-panel">
-            <div className="pf-value-card__icon">
-              <Icon size={22} strokeWidth={2} />
-            </div>
-            <h3>{item.title}</h3>
-            <p>{item.text}</p>
-          </article>
-        );
-      })}
-    </div>
-  );
+  return <section className="career-loading" role="status" aria-live="polite"><div className="career-loading__intro"><span className="eyebrow"><BrainCircuit size={14}/> Career intelligence at work</span><h2>Mapping your next move</h2><p>We’re reading your resume for concrete evidence—not generating a generic report.</p></div><div className="career-orbit"><div className="career-orbit__ring ring-one"/><div className="career-orbit__ring ring-two"/><div className="career-orbit__core"><FileSearch size={28}/><span>Resume</span></div>{stages.map(([label, Icon], index) => <div className={`career-orbit__node node-${index + 1}`} key={label}><Icon size={17}/><span>{label}</span></div>)}</div><div className="career-loading__steps">{stages.map(([label, Icon], index) => <div key={label} style={{ animationDelay: `${index * .65}s` }}><span><Icon size={14}/></span>{label}</div>)}</div></section>;
 }
 
-function ProcessTimeline({ step }) {
-  const steps = [
-    { id: 1, label: 'Upload Resume', icon: Upload },
-    { id: 2, label: 'Resume Scan', icon: FileSearch },
-    { id: 3, label: 'Results & Report', icon: FileText },
-  ];
-  return (
-    <section className="pf-timeline glass-panel" id="timeline">
-      <h2 className="pf-timeline__title">Your PathFinder Journey</h2>
-      <div className="pf-timeline__track">
-        {steps.map((s, index) => {
-          const Icon = s.icon;
-          const status = step > s.id ? 'done' : step === s.id ? 'active' : 'pending';
-          return (
-            <div key={s.id} className={`pf-timeline__step pf-timeline__step--${status}`}>
-              <div className="pf-timeline__node">
-                {status === 'done' ? <CheckCircle2 size={22} /> : <Icon size={22} />}
-              </div>
-              <span className="pf-timeline__label">{s.label}</span>
-              {index < steps.length - 1 && <div className="pf-timeline__connector" />}
-            </div>
-          );
-        })}
-      </div>
-    </section>
-  );
+function InsightDashboard({ data }) {
+  const scorecard = data.scorecard || { overall: data.ats_score || 0, sections: {}, evidence: [] };
+  const sections = Object.entries(scorecard.sections || {});
+  const strengths = (data.matched_skills || []).slice(0, 8);
+  const gaps = (data.missing_skills || []).slice(0, 6);
+  const verdict = scorecard.overall >= 75 ? 'Strong screening foundation' : scorecard.overall >= 55 ? 'Promising, with targeted gaps' : 'Needs sharper positioning';
+  return <section className="dashboard" id="dashboard"><div className="dash-heading"><div><p className="eyebrow">Career intelligence brief</p><h2>{data.candidate_name || 'Your'}’s opportunity map</h2><p>{data.detected_domain} · target: <b>{data.predicted_role}</b></p></div><div className="dash-actions"><button className="report-button" onClick={() => downloadCareerReport(data)}><Download size={15}/> Download full report</button><span className="status-pill"><Activity size={14}/> Analysis complete</span></div></div>
+    <div className="hero-grid"><article className="score-card panel"><ScoreRing score={scorecard.overall}/><div className="score-copy"><span className="label">Recruiter signal</span><h3>{verdict}</h3><p>This score is derived from resume structure, skill coverage, evidence of impact, and readability—not a random estimate.</p><a href="#evidence">See score evidence <ArrowUpRight size={15}/></a></div></article><article className="summary-card panel"><div className="card-top"><span className="icon-wrap purple"><BrainCircuit size={20}/></span><span className="label">AI career read</span></div><p>{data.career_suggestions || data.custom_suggestion}</p><div className="role-chips">{(data.recommended_roles || []).slice(0, 4).map(role => <span key={role}>{role}</span>)}</div></article></div>
+    <div className="metrics-grid">{sections.map(([name, value], i) => <article className="metric panel" key={name}><div><span>{name}</span><b>{value}<small>/100</small></b></div><div className="bar"><i style={{ width: `${value}%`, transitionDelay: `${i * 80}ms` }}/></div></article>)}</div>
+    <div className="intel-grid"><article className="panel skills-card"><div className="section-title"><div><span className="label">Capability map</span><h3>Strengths & growth edges</h3></div><Radar size={20}/></div><div className="skill-group"><p><Check size={15}/> Confirmed strengths</p><div className="chips">{strengths.map(x => <span className="good" key={x}>{x}</span>) || <em>No skills reliably extracted</em>}</div></div><div className="skill-group"><p><Target size={15}/> Highest-value gaps</p><div className="chips">{gaps.map(x => <span className="gap" key={x}>{x}</span>) || <em>No major gaps identified</em>}</div></div></article><article className="panel evidence-card" id="evidence"><div className="section-title"><div><span className="label">Explainability</span><h3>Why this score</h3></div><Gauge size={20}/></div><ol>{(scorecard.evidence || []).map((item, i) => <li key={item}><b>0{i + 1}</b><span>{item}</span></li>)}</ol></article></div>
+    <section className="panel roadmap"><div className="section-title"><div><span className="label">Growth simulator</span><h3>Your next 90 days</h3></div><Zap size={20}/></div><div className="roadmap-grid">{(data.learning_roadmap || []).map(step => <article key={step.step}><span>{String(step.step).padStart(2, '0')}</span><h4>{step.title}</h4><p>{step.focus}</p><small>{step.project_idea}</small></article>)}</div></section>
+    <LiveJobOpenings recommendedRoles={data.recommended_roles} matchedSkills={data.job_search_skills || data.matched_skills} jobsByRole={data.jobs_by_role} jobsMessage={data.jobs_message} jobsCount={data.jobs_count}/>
+  </section>;
 }
 
-function HeroUpload({ file, setFile, loading, error, onAnalyze }) {
-  const onDrop = useCallback((accepted) => {
-    if (accepted?.[0]) setFile(accepted[0]);
-  }, [setFile]);
-
-  const { getRootProps, getInputProps, isDragActive } = useDropzone({
-    onDrop,
-    accept: { 'application/pdf': ['.pdf'] },
-    maxFiles: 1,
-    multiple: false,
-    disabled: loading,
-  });
-
-  return (
-    <div className="pf-upload glass-panel" id="upload">
-      <div
-        {...getRootProps()}
-        className={`pf-dropzone ${isDragActive ? 'pf-dropzone--active' : ''} ${file ? 'pf-dropzone--ready' : ''} ${loading ? 'pf-dropzone--disabled' : ''}`}
-      >
-        <input {...getInputProps()} />
-        <div className="pf-dropzone__icon-wrap">
-          <Upload size={32} strokeWidth={1.75} />
-        </div>
-        {file ? (
-          <>
-            <p className="pf-dropzone__title">{file.name}</p>
-            <p className="pf-dropzone__meta">{(file.size / 1024).toFixed(1)} KB ready for analysis</p>
-          </>
-        ) : (
-          <>
-            <p className="pf-dropzone__title">
-              {isDragActive ? 'Release to upload your PDF' : 'Drag & drop your resume'}
-            </p>
-            <p className="pf-dropzone__meta">PDF only · click to browse files</p>
-          </>
-        )}
-      </div>
-
-      <button
-        type="button"
-        className="pf-btn pf-btn--primary"
-        onClick={onAnalyze}
-        disabled={loading || !file}
-      >
-        {loading ? (
-          <>
-            <Loader2 className="pf-btn__spin" size={18} />
-            Analyzing Resume
-          </>
-        ) : (
-          'Analyze Resume'
-        )}
-      </button>
-
-      {error && (
-        <div className="pf-alert" role="alert">
-          {error}
-        </div>
-      )}
-    </div>
-  );
+export default function App() {
+  const [file, setFile] = useState(null); const [loading, setLoading] = useState(false); const [result, setResult] = useState(null); const [error, setError] = useState('');
+  const analyze = async () => { if (!file) return; setLoading(true); setError(''); setResult(null); try { const form = new FormData(); form.append('file', file); const response = await axios.post(`${api}/analyze`, form, { timeout: 120000 }); if (response.data.error) throw new Error(response.data.error); setResult(response.data); setTimeout(() => document.querySelector('#dashboard')?.scrollIntoView({ behavior: 'smooth' }), 80); } catch (e) { setError(errorMessage(e)); } finally { setLoading(false); } };
+  const jobCount = useMemo(() => result?.jobs_count || 0, [result]);
+  return <div className="app-shell"><div className="ambient ambient-one"/><div className="ambient ambient-two"/><header><a className="brand" href="#top"><span>◈</span> Resume<span className="muted">Navigator</span></a><nav><a href="#analyze">Analyzer</a><a href="#dashboard">Intelligence</a><a href="#live-jobs">Opportunities</a></nav><button className="quiet-button" onClick={() => document.querySelector('#analyze')?.scrollIntoView({ behavior: 'smooth' })}>Start analysis <ArrowUpRight size={15}/></button></header><main id="top"><section className="hero"><div className="hero-copy"><p className="eyebrow"><Sparkles size={14}/> AI-powered career intelligence</p><h1>Make your next<br/><em>move</em> unmistakable.</h1><p className="hero-text">ResumeNavigator reads your resume like a modern hiring team: structure, evidence, skills, and role alignment—then turns the signal into an actionable career brief.</p><div className="trust-row"><span><b>Explainable</b> scoring</span><i/><span><b>Private</b> document scan</span><i/><span><b>{jobCount || 'Live'}</b> role matches</span></div></div><div className="orbital"><div className="orbital-card card-a"><span>ATS signal</span><b>{result?.ats_score ?? '—'}</b><small>Evidence-based</small></div><div className="orbital-card card-b"><BrainCircuit size={22}/><span>Career DNA</span><small>Role alignment</small></div><div className="core-orb"><Sparkles size={32}/></div></div></section><UploadPanel file={file} setFile={setFile} loading={loading} analyze={analyze}/>{error && <div className="error-box">{error}</div>}{loading && <CareerAnalysisAnimation/>}{result && <InsightDashboard data={result}/>}</main><footer><span>ResumeNavigator Career Intelligence</span><span>Built for clear next moves.</span></footer></div>;
 }
-
-function AtsScoreRing({ score }) {
-  const radius = 54;
-  const circ = 2 * Math.PI * radius;
-  const offset = circ - (score / 100) * circ;
-  const color = score >= 75 ? '#10b981' : score >= 50 ? '#f59e0b' : '#ef4444';
-
-  return (
-    <div className="pf-score">
-      <svg viewBox="0 0 128 128" className="pf-score__svg">
-        <circle cx="64" cy="64" r={radius} className="pf-score__track" />
-        <circle
-          cx="64"
-          cy="64"
-          r={radius}
-          className="pf-score__fill"
-          style={{ strokeDasharray: circ, strokeDashoffset: offset, stroke: color }}
-        />
-      </svg>
-      <div className="pf-score__label">
-        <span className="pf-score__value" style={{ color }}>{score}</span>
-        <span className="pf-score__caption">ATS Score</span>
-      </div>
-    </div>
-  );
-}
-
-function App() {
-  const [file, setFile] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [results, setResults] = useState(null);
-  const [error, setError] = useState(null);
-
-  const timelineStep = useMemo(() => {
-    if (results) return 3;
-    if (loading) return 2;
-    if (file) return 2;
-    return 1;
-  }, [file, loading, results]);
-
-  const handleAnalyze = async () => {
-    if (!file) return;
-    setLoading(true);
-    setError(null);
-    setResults(null);
-
-    try {
-      const formData = new FormData();
-      formData.append('file', file, file.name);
-      const response = await axios.post(getAnalyzeUrl(), formData, { timeout: 120000 });
-
-      if (response.data?.error) {
-        setError(response.data.error);
-        return;
-      }
-
-      setResults(response.data);
-    } catch (err) {
-      setError(formatApiError(err));
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const matched = results?.matched_skills ?? [];
-  const missing = results?.missing_skills ?? [];
-  const role = results?.predicted_role;
-  const roadmap = results?.learning_roadmap ?? [];
-  const careerSuggestions = results?.career_suggestions ?? results?.custom_suggestion ?? '';
-  const meta = results?.candidate_metadata ?? {};
-  const candidateName = meta.candidate_name || results?.candidate_name || 'Not found';
-  const candidateEmail = meta.candidate_email || results?.candidate_email || 'Not found';
-  const candidatePhone = meta.candidate_phone || results?.candidate_phone || 'Not found';
-  const candidateCollege = meta.candidate_college || results?.candidate_college || 'Not found';
-  const detectedDomain = results?.detected_domain || 'Not specified';
-  const recommendedRoles = results?.recommended_roles ?? [];
-  const jobsByRole = results?.jobs_by_role ?? {};
-  const jobsMessage = results?.jobs_message ?? null;
-  const jobsCount = results?.jobs_count ?? 0;
-
-  const generatePDFReport = () => {
-    if (!results) return;
-    const doc = new jsPDF();
-    let y = 16;
-
-    doc.setFontSize(18);
-    doc.text('PathFinder Career Report', 14, y);
-    y += 10;
-
-    doc.setFontSize(11);
-    const lines = [
-      `Candidate Name: ${candidateName}`,
-      `Email: ${candidateEmail}`,
-      `Phone: ${candidatePhone}`,
-      `College: ${candidateCollege}`,
-      `Detected Domain: ${detectedDomain}`,
-      `Predicted Role: ${role || 'N/A'}`,
-      `Recommended Roles: ${(recommendedRoles || []).join(', ') || 'N/A'}`,
-      `ATS Score: ${results.ats_score ?? 0}/100`,
-    ];
-    lines.forEach((line) => {
-      doc.text(line, 14, y, { maxWidth: 180 });
-      y += 6;
-    });
-    y += 4;
-
-    doc.setFontSize(13);
-    doc.text('Matched Skills', 14, y);
-    y += 6;
-    doc.setFontSize(11);
-    doc.text(matched.length ? matched.join(', ') : 'None detected.', 14, y, { maxWidth: 180 });
-    y += 10;
-
-    doc.setFontSize(13);
-    doc.text('Skill Gaps', 14, y);
-    y += 6;
-    doc.setFontSize(11);
-    doc.text(missing.length ? missing.join(', ') : 'No major gaps listed.', 14, y, { maxWidth: 180 });
-    y += 12;
-
-    doc.setFontSize(13);
-    doc.text('Career Suggestions', 14, y);
-    y += 6;
-    doc.setFontSize(10);
-    const suggestionLines = doc.splitTextToSize(
-      careerSuggestions || 'No career suggestions available.',
-      180,
-    );
-    doc.text(suggestionLines, 14, y);
-    y += suggestionLines.length * 5 + 8;
-
-    doc.setFontSize(13);
-    doc.text('Learning Roadmap', 14, y);
-    y += 4;
-    autoTable(doc, {
-      startY: y,
-      head: [['Step', 'Title', 'Focus', 'Project Idea']],
-      body: (roadmap.length ? roadmap : [{ step: 1, title: 'Unavailable', focus: '-', project_idea: '-' }]).map((step) => [
-        String(step.step ?? ''),
-        String(step.title ?? ''),
-        String(step.focus ?? ''),
-        String(step.project_idea ?? ''),
-      ]),
-      styles: { fontSize: 9, cellPadding: 2 },
-      headStyles: { fillColor: [30, 41, 59] },
-    });
-
-    y = doc.lastAutoTable ? doc.lastAutoTable.finalY + 10 : y + 20;
-    doc.setFontSize(13);
-    doc.text('Live Job Openings (India)', 14, y);
-    y += 4;
-
-    const rows = [];
-    Object.entries(jobsByRole).forEach(([roleKey, roleJobs]) => {
-      (roleJobs || []).forEach((job) => {
-        rows.push([
-          roleKey,
-          String(job.company_name || job.employer_name || ''),
-          String(job.job_title || ''),
-          String(job.redirect_url || job.job_apply_link || ''),
-        ]);
-      });
-    });
-
-    autoTable(doc, {
-      startY: y,
-      head: [['Role', 'Company', 'Job Title', 'Apply Link']],
-      body: rows.length ? rows : [['-', '-', '-', '-']],
-      styles: { fontSize: 8, cellPadding: 2 },
-      headStyles: { fillColor: [79, 70, 229] },
-    });
-
-    doc.save('PathFinder-Career-Report.pdf');
-  };
-
-  return (
-    <div className="pf-app">
-      <div className="pf-mesh" aria-hidden="true" />
-      <Header />
-
-      <main className="pf-main">
-        <section className="pf-hero">
-          <p className="pf-hero__eyebrow">Career path discovery</p>
-          <h1 className="pf-hero__title pf-gradient-text">PathFinder</h1>
-          <p className="pf-hero__subtitle">
-            Upload your PDF resume for ATS scoring, precise skill extraction, and live India job matches.
-            Personalized career roadmaps are delivered exclusively in your downloadable report.
-          </p>
-          <ValueProps />
-          <HeroUpload
-            file={file}
-            setFile={setFile}
-            loading={loading}
-            error={error}
-            onAnalyze={handleAnalyze}
-          />
-        </section>
-
-        <ProcessTimeline step={timelineStep} />
-
-        {loading && (
-          <div className="pf-loading glass-panel" role="status" aria-live="polite">
-            <Loader2 className="pf-loading__icon" size={36} />
-            <p>Processing your resume…</p>
-          </div>
-        )}
-
-        {results && (
-          <section className="pf-dashboard glass-panel" id="dashboard">
-            <div className="pf-dashboard__header">
-              <h2>Analysis Results</h2>
-              <p>Your dashboard reflects the unique content extracted from your resume.</p>
-            </div>
-
-            <div className="pf-dashboard__meta glass-panel pf-dashboard__meta--inner">
-              <p><strong>Name:</strong> {candidateName}</p>
-              <p><strong>Email:</strong> {candidateEmail}</p>
-              <p><strong>Phone:</strong> {candidatePhone}</p>
-              <p><strong>College:</strong> {candidateCollege}</p>
-              <p><strong>Domain:</strong> {detectedDomain}</p>
-              <p><strong>Predicted role:</strong> {role || 'N/A'}</p>
-              <p>
-                <strong>Recommended roles:</strong>{' '}
-                {recommendedRoles.length ? recommendedRoles.join(', ') : 'N/A'}
-              </p>
-            </div>
-
-            <div className="pf-dashboard__grid">
-              <div className="pf-card glass-panel pf-card--center">
-                <AtsScoreRing score={results.ats_score ?? 0} />
-                <p className="pf-card__hint">
-                  {results.ats_score >= 75
-                    ? 'Strong alignment for your target role.'
-                    : results.ats_score >= 50
-                    ? 'Solid foundation with room to close skill gaps.'
-                    : 'Prioritize missing keywords and clearer resume structure.'}
-                </p>
-              </div>
-
-              <div className="pf-card glass-panel">
-                <h3>Matched Skills</h3>
-                <ul className="pf-list">
-                  {matched.length > 0 ? matched.map((s, i) => <li key={i}>{s}</li>) : (
-                    <li className="pf-list__empty">No professional skills detected.</li>
-                  )}
-                </ul>
-
-                <h3 className="pf-card__subtitle">Skill Gaps</h3>
-                <div className="pf-chips">
-                  {missing.length > 0 ? missing.map((s, i) => (
-                    <span className="pf-chip" key={i}>{s}</span>
-                  )) : (
-                    <span className="pf-list__empty">No major gaps detected.</span>
-                  )}
-                </div>
-              </div>
-            </div>
-
-            <div className="pf-dashboard__actions">
-              <button type="button" className="pf-btn pf-btn--primary" onClick={generatePDFReport}>
-                Download Career Report (PDF)
-              </button>
-              <p className="pf-dashboard__note">
-                Career suggestions and milestone roadmaps are included in the PDF report only.
-              </p>
-            </div>
-
-            <LiveJobOpenings
-              recommendedRoles={recommendedRoles}
-              jobsByRole={jobsByRole}
-              jobsMessage={jobsMessage}
-              jobsCount={jobsCount}
-              loading={false}
-            />
-          </section>
-        )}
-      </main>
-
-      <footer className="pf-footer glass-panel">
-        <span className="pf-gradient-text pf-footer__brand">PathFinder</span>
-        <span>© {new Date().getFullYear()}</span>
-      </footer>
-    </div>
-  );
-}
-
-export default App;
