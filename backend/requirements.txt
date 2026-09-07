@@ -1,10 +1,32 @@
+# ── Core API (required — installs cleanly everywhere) ─────────────────────
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 python-multipart>=0.0.12
 requests>=2.32.0
 python-dotenv>=1.0.0
 google-genai>=1.0.0
+
+# ── Resume parsing ──────────────────────────────────────────────────────
 pdfminer.six>=20240706
 pypdf>=5.0.0
-pymongo>=4.4.0
 python-docx>=0.8.11
+
+# ── Lightweight NLP signals (small pure/wheel packages, safe to install) ──
+# These enable fuzzy matching, TF-IDF/BM25 relevance and readability scoring.
+# The engine still runs if they are missing (graceful degradation).
+numpy>=1.26.0
+scikit-learn>=1.4.0
+rapidfuzz>=3.9.0
+rank-bm25>=0.2.2
+textstat>=0.7.4
+
+# ── Optional persistence (legacy database.py; not needed to run) ──────────
+pymongo>=4.4.0
+
+# ── Heavy semantic stack (sentence-transformers + spaCy) is OPTIONAL ──────
+# It pulls in PyTorch (large) and can be slow/fragile to install on Windows,
+# so it is intentionally NOT listed here. To unlock true embedding-based
+# semantic matching + NER, install it separately:
+#     pip install -r requirements-ml.txt
+#     python -m spacy download en_core_web_sm
+# Without it, ResumeNavigator uses the built-in skill ontology (still semantic).

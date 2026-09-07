@@ -1,0 +1,17 @@
+# ── OPTIONAL heavy NLP stack for full semantic intelligence ───────────────
+# Install ONLY if you want true embedding-based semantic skill matching and
+# spaCy Named Entity Recognition. This pulls in PyTorch and can take a while.
+#
+#   pip install -r requirements-ml.txt
+#   python -m spacy download en_core_web_sm
+#
+# The app runs fine WITHOUT this file — nlp_engine.py degrades gracefully to
+# the built-in skill ontology. Enable embeddings after install by setting
+# ENABLE_EMBEDDINGS=true in backend/.env (kept off by default so the first
+# request never blocks on a large model download).
+
+sentence-transformers>=3.0.0
+spacy>=3.7.0
+
+# Optional precise grammar checking (also needs a Java runtime):
+# language-tool-python>=2.8

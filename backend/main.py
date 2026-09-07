@@ -1,3 +1,4 @@
+# Copyright (c) 2026 chandankumardv22
 from __future__ import annotations
 
 import json
@@ -5,8 +6,10 @@ import os
 import re
 import shutil
 import sys
+import urllib.parse
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from typing import Any
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -28,7 +31,7 @@ def _log(msg: object) -> None:
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from google import genai
@@ -42,16 +45,89 @@ try:
     from .pdf_parser import extract_pdf_text
     from .skills import (
         DOMAIN_PROFILES, _NON_RESUME_SIGNALS, _RESUME_SIGNALS,
-        compute_missing_skills, detect_domain, extract_professional_skills,
-        infer_roles_from_skills, merge_recommended_roles, sanitize_skills,
+        analyze_for_target_role, compute_missing_skills, detect_domain,
+        extract_professional_skills, infer_roles_from_skills,
+        merge_recommended_roles, sanitize_skills,
     )
 except ImportError:  # pragma: no cover - used only when launched from backend/
     from pdf_parser import extract_pdf_text
     from skills import (
         DOMAIN_PROFILES, _NON_RESUME_SIGNALS, _RESUME_SIGNALS,
-        compute_missing_skills, detect_domain, extract_professional_skills,
-        infer_roles_from_skills, merge_recommended_roles, sanitize_skills,
+        analyze_for_target_role, compute_missing_skills, detect_domain,
+        extract_professional_skills, infer_roles_from_skills,
+        merge_recommended_roles, sanitize_skills,
     )
+
+try:
+    try:
+        from .resume_nlp import extract_resume_text, nlp_parse_resume
+        from .role_predictor import predict_job_role, role_predictor_status
+    except ImportError:
+        from resume_nlp import extract_resume_text, nlp_parse_resume
+        from role_predictor import predict_job_role, role_predictor_status
+except Exception as _algo_exc:  # pragma: no cover
+    _log(f"[algorithms] resume_nlp/role_predictor unavailable: {_algo_exc!r}")
+
+    def extract_resume_text(path: str) -> str:
+        return extract_pdf_text(path)
+
+    def nlp_parse_resume(text: str, domain: str | None = None) -> dict[str, Any]:
+        return {
+            "cleaned_text": text,
+            "skills": [],
+            "academic_degrees": [],
+            "years_of_experience": 0,
+            "detected_domain": domain or "General / Fresher",
+            "algorithm": "Natural Language Processing (rules + regex)",
+        }
+
+    def predict_job_role(resume_text: str, matched_skills: list[str] | None = None) -> dict[str, Any]:
+        return {"predicted_role": None, "confidence": 0.0, "available": False, "algorithm": "TF-IDF + Logistic Regression"}
+
+    def role_predictor_status() -> dict[str, Any]:
+        return {"available": False, "algorithm": "TF-IDF + Logistic Regression"}
+
+# The NLP engine is optional and may pull in heavy libraries. It must NEVER be
+# able to prevent the API from starting, so any failure here falls back to
+# lightweight scoring instead of crashing the process.
+try:
+    try:
+        from .nlp_engine import (
+            compute_ats, engine_capabilities, extract_semantic_skills,
+            semantic_match_skills,
+        )
+    except ImportError:
+        from nlp_engine import (
+            compute_ats, engine_capabilities, extract_semantic_skills,
+            semantic_match_skills,
+        )
+except Exception as _nlp_exc:  # pragma: no cover - defensive
+    _log(f"[nlp] engine unavailable ({type(_nlp_exc).__name__}: {_nlp_exc!r}); using lightweight fallback.")
+
+    def engine_capabilities() -> dict[str, Any]:
+        return {
+            "embeddings": False, "embedding_model": "n/a", "spacy_ner": False,
+            "tfidf": False, "bm25": False, "fuzzy": False, "readability": False,
+            "note": "NLP engine failed to load; using ontology fallback.",
+        }
+
+    def extract_semantic_skills(text: str, domain: str, limit: int = 30) -> list[str]:
+        return extract_professional_skills(text, domain)[:limit]
+
+    def semantic_match_skills(resume_text: str, required_skills, threshold=None) -> dict[str, Any]:
+        lower = (resume_text or "").lower()
+        matched, missing = [], []
+        for s in required_skills:
+            s = str(s).strip()
+            if s and s.lower() in lower:
+                matched.append({"skill": s, "method": "exact", "confidence": 0.9, "evidence": f"'{s}' found in resume"})
+            elif s:
+                missing.append({"skill": s, "confidence": 0.0})
+        return {"matched": matched, "missing": missing}
+
+    def compute_ats(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        # Signals _build_scorecard to use its own minimal deterministic fallback.
+        raise RuntimeError("nlp_engine unavailable")
 
 _BACKEND_DIR = Path(__file__).resolve().parent
 load_dotenv(_BACKEND_DIR / ".env")
@@ -60,13 +136,14 @@ RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "").strip()
 RAPIDAPI_HOST = os.getenv("RAPIDAPI_HOST", "jsearch.p.rapidapi.com").strip()
 ADZUNA_APP_ID = os.getenv("ADZUNA_APP_ID", "").strip()
 ADZUNA_APP_KEY = os.getenv("ADZUNA_APP_KEY", "").strip()
-JOBS_PER_ROLE = 4
-JOB_API_TIMEOUT = 30
+JOBS_PER_ROLE = 20
+JOB_API_TIMEOUT = 5
 MAX_JOB_ROLES = 5
 INVALID_PDF_TEXT_ERROR = (
-    "Unable to read text from this PDF. It may be scanned or image-only. "
-    "Please upload a text-based PDF exported from Word, Google Docs, or a resume builder."
+    "Unable to read text from this resume. It may be scanned or image-only. "
+    "Please upload a text-based PDF or Word (.docx) exported from Word, Google Docs, or a resume builder."
 )
+SUPPORTED_RESUME_EXTENSIONS = {".pdf", ".docx"}
 _PLACEHOLDER_KEYS = {
     "your_gemini_api_key",
     "your_rapidapi_key",
@@ -87,6 +164,8 @@ _genai_client = (
     if _is_real_key(GEMINI_API_KEY)
     else None
 )
+if _genai_client is None:
+    _log("[gemini] GEMINI_API_KEY missing or invalid. Gemini functionality disabled.")
 
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
@@ -97,12 +176,19 @@ ALLOWED_ORIGINS = [
     "http://127.0.0.1:3002",
 ]
 
+# Also accept the frontend when it is served from any LAN IP / hostname on a
+# common dev port (e.g. http://10.196.2.110:3000 when testing across devices).
+# The app uses no cookies/session auth, so echoing the specific origin here is
+# safe. Using a regex (not "*") keeps allow_credentials working.
+ALLOWED_ORIGIN_REGEX = r"https?://[A-Za-z0-9.\-]+(:(3000|3001|3002))?$"
+
 INVALID_RESUME_ERROR = "Invalid document type. Please upload a valid resume."
 
 app = FastAPI(title="PathFinder API", version="3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=ALLOWED_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -143,12 +229,32 @@ ATS_JSON_SCHEMA = {
 
 class FetchJobsRequest(BaseModel):
     recommended_roles: list[str] = Field(default_factory=list)
+    matched_skills: list[str] | None = Field(default=None)
+    jobs_per_role: int = Field(default=JOBS_PER_ROLE)
+    candidate_location: str | None = Field(default=None, max_length=120)
 
+
+class ApplyJobRequest(BaseModel):
+    """Record that the candidate started an application for a skill-matched opening."""
+    job_title: str = Field(min_length=1, max_length=200)
+    company_name: str = Field(default="Hiring Company", max_length=200)
+    redirect_url: str = Field(min_length=5, max_length=2000)
+    role_category: str | None = Field(default=None, max_length=120)
+    skill_match_pct: int | None = Field(default=None, ge=0, le=100)
+    matched_skills: list[str] | None = Field(default=None)
+    candidate_name: str | None = Field(default=None, max_length=120)
+    candidate_email: str | None = Field(default=None, max_length=200)
 
 class ResumeTextRequest(BaseModel):
     """Used by interactive intelligence tools after a resume has been parsed."""
     resume_text: str = Field(min_length=35, max_length=50000)
     target_role: str | None = Field(default=None, max_length=120)
+
+
+class RoleAnalysisRequest(BaseModel):
+    """Used by the Role Explorer to analyze resume skills against a target role."""
+    resume_text: str = Field(min_length=35, max_length=50000)
+    target_role: str = Field(min_length=1, max_length=120)
 
 
 class JobMatchRequest(ResumeTextRequest):
@@ -169,6 +275,8 @@ def _job_record(
     redirect_url: str,
     employment_type: str = "Full-time",
     source: str = "Job provider",
+    tags: list[str] | None = None,
+    description: str = "",
 ) -> dict[str, Any]:
     url = redirect_url or "#"
     return {
@@ -181,7 +289,187 @@ def _job_record(
         "job_apply_link": url,
         "job_employment_type": employment_type,
         "source": source,
+        "tags": [str(t).strip() for t in (tags or []) if str(t).strip()][:12],
+        "description": (description or "")[:600],
+        "skill_match_pct": 0,
+        "matched_skills": [],
     }
+
+
+def _score_job_against_skills(job: dict[str, Any], skills: list[str] | None) -> dict[str, Any]:
+    """Rank a listing by overlap between the candidate's matched skills and the job text."""
+    skill_list = [str(s).strip() for s in (skills or []) if str(s).strip()]
+    if not skill_list:
+        job["skill_match_pct"] = 50
+        job["matched_skills"] = []
+        return job
+
+    haystack = " ".join(
+        [
+            str(job.get("job_title") or ""),
+            str(job.get("company_name") or ""),
+            str(job.get("role_category") or ""),
+            str(job.get("description") or ""),
+            " ".join(job.get("tags") or []),
+            str(job.get("source") or ""),
+        ]
+    ).lower()
+
+    hits: list[str] = []
+    for skill in skill_list:
+        token = skill.lower().strip()
+        if len(token) < 2:
+            continue
+        # Prefer whole-token / phrase hits so short skills (e.g. "C") don't false-positive.
+        if token in haystack or all(part in haystack for part in token.replace("/", " ").split() if len(part) > 1):
+            hits.append(skill)
+
+    denom = min(8, max(len(skill_list), 1))
+    pct = int(round(100 * min(len(hits), denom) / denom))
+    if hits and pct < 35:
+        pct = 35
+    job["skill_match_pct"] = pct
+    job["matched_skills"] = hits[:8]
+    return job
+
+
+def _annotate_and_rank_jobs(
+    jobs: list[dict[str, Any]],
+    skills: list[str] | None,
+) -> list[dict[str, Any]]:
+    ranked = [_score_job_against_skills(dict(job), skills) for job in jobs]
+    # Real listings first, then portal searches; within each group, highest skill match.
+    ranked.sort(
+        key=lambda j: (
+            0 if str(j.get("job_employment_type") or "").lower() != "search" else 1,
+            -int(j.get("skill_match_pct") or 0),
+            str(j.get("job_title") or "").lower(),
+        )
+    )
+    return ranked
+
+
+def _is_direct_apply_job(job: dict[str, Any]) -> bool:
+    """Only keep listings with a real http(s) apply link (not portal search cards)."""
+    url = str(job.get("redirect_url") or job.get("job_apply_link") or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return False
+    employment = str(job.get("job_employment_type") or "").lower()
+    source = str(job.get("source") or "").lower()
+    if employment == "search" or source.endswith("search"):
+        return False
+    return True
+
+
+# Canonical Indian cities -> aliases used on resumes and job boards.
+_CITY_ALIASES: dict[str, tuple[str, ...]] = {
+    "Bengaluru": ("bengaluru", "bangalore", "blr", "bengalooru"),
+    "Mumbai": ("mumbai", "bombay", "navi mumbai", "thane", "navi-mumbai"),
+    "Delhi": ("delhi", "new delhi", "ncr", "delhi ncr"),
+    "Gurugram": ("gurugram", "gurgaon"),
+    "Noida": ("noida", "greater noida"),
+    "Hyderabad": ("hyderabad", "secunderabad", "cyberabad"),
+    "Chennai": ("chennai", "madras"),
+    "Pune": ("pune", "pimpri", "chinchwad"),
+    "Kolkata": ("kolkata", "calcutta", "howrah"),
+    "Ahmedabad": ("ahmedabad", "amdavad"),
+    "Jaipur": ("jaipur",),
+    "Kochi": ("kochi", "cochin", "ernakulam"),
+    "Chandigarh": ("chandigarh", "mohali", "panchkula"),
+    "Indore": ("indore",),
+    "Coimbatore": ("coimbatore",),
+    "Thiruvananthapuram": ("thiruvananthapuram", "trivandrum"),
+    "Lucknow": ("lucknow",),
+    "Bhopal": ("bhopal",),
+    "Nagpur": ("nagpur",),
+    "Surat": ("surat",),
+    "Vadodara": ("vadodara", "baroda"),
+    "Mysuru": ("mysuru", "mysore"),
+    "Visakhapatnam": ("visakhapatnam", "vizag"),
+    "Bhubaneswar": ("bhubaneswar", "bhubaneshwar"),
+    "Patna": ("patna",),
+    "Ranchi": ("ranchi",),
+    "Guwahati": ("guwahati",),
+    "Dehradun": ("dehradun", "dehra dun"),
+}
+
+
+def _resolve_location_profile(location_hint: str | None) -> dict[str, Any] | None:
+    """Normalize a free-text location into a city profile with match aliases."""
+    if not location_hint:
+        return None
+    raw = str(location_hint).strip()
+    if not raw or raw.lower() in {"not found", "n/a", "na", "india"}:
+        return None
+    lower = raw.lower()
+    for canonical, aliases in _CITY_ALIASES.items():
+        if any(alias in lower for alias in aliases) or canonical.lower() in lower:
+            return {
+                "city": canonical,
+                "display": canonical,
+                "aliases": tuple(dict.fromkeys((canonical.lower(),) + aliases)),
+                "country": "India",
+                "query": f"{canonical}, India",
+            }
+    first = re.split(r"[,|/]|-", raw)[0].strip()
+    if 2 <= len(first) <= 40 and re.match(r"^[A-Za-z][A-Za-z .'-]+$", first):
+        return {
+            "city": first.title(),
+            "display": first.title(),
+            "aliases": (first.lower(),),
+            "country": "India",
+            "query": f"{first.title()}, India",
+        }
+    return None
+
+
+def _extract_candidate_location(resume_text: str) -> dict[str, Any] | None:
+    """Pull the candidate's city/address from resume contact lines."""
+    text = resume_text or ""
+    lower = text.lower()
+
+    for canonical, aliases in _CITY_ALIASES.items():
+        for alias in aliases:
+            if re.search(rf"\b{re.escape(alias)}\b", lower):
+                return _resolve_location_profile(canonical)
+
+    for ln in text.splitlines():
+        line = ln.strip()
+        if not line:
+            continue
+        m = re.match(r"(?i)^(?:location|address|city|based in|residing in)\s*[:\-]\s*(.+)$", line)
+        if m:
+            profile = _resolve_location_profile(m.group(1))
+            if profile:
+                return profile
+        if _looks_like_location(line):
+            profile = _resolve_location_profile(line)
+            if profile:
+                return profile
+    return None
+
+
+def _job_matches_candidate_location(job: dict[str, Any], location: dict[str, Any] | None) -> bool:
+    """True when the listing is in the candidate's city (or that metro area)."""
+    loc = str(job.get("location") or "").lower()
+    if not location:
+        # No city on resume — keep only clearly India-based roles (not global remote).
+        rank = _india_location_rank(loc)
+        return rank == 0
+
+    if not loc:
+        return False
+    aliases = location.get("aliases") or ()
+    if any(alias and alias in loc for alias in aliases):
+        return True
+    hay = " ".join(
+        [
+            str(job.get("job_title") or ""),
+            str(job.get("description") or ""),
+            " ".join(job.get("tags") or []),
+        ]
+    ).lower()
+    return any(alias and alias in hay for alias in aliases)
 
 
 def jobs_provider_status() -> dict[str, Any]:
@@ -190,15 +478,25 @@ def jobs_provider_status() -> dict[str, Any]:
     return {
         "jsearch_configured": has_jsearch,
         "adzuna_configured": has_adzuna,
-        "any_provider": has_jsearch or has_adzuna,
+        # Free, no-key providers (Remotive / Arbeitnow / RemoteOK) and a guaranteed
+        # search-portal fallback keep listings available even without any API key.
+        "free_providers": True,
+        "keyed_providers": has_jsearch or has_adzuna,
+        "any_provider": True,
     }
 
 
-def fetch_jsearch_jobs(role_category: str, skills: list[str] | None = None, limit: int = JOBS_PER_ROLE) -> list[dict[str, Any]]:
+def fetch_jsearch_jobs(
+    role_category: str,
+    skills: list[str] | None = None,
+    limit: int = JOBS_PER_ROLE,
+    location: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     if not _is_real_key(RAPIDAPI_KEY):
         return []
     skill_query = " ".join((skills or [])[:4])
-    query = f"{role_category} {skill_query} in India".strip()
+    place = (location or {}).get("query") or "India"
+    query = f"{role_category} {skill_query} in {place}".strip()
     out: list[dict[str, Any]] = []
     try:
         r = requests.get(
@@ -221,16 +519,19 @@ def fetch_jsearch_jobs(role_category: str, skills: list[str] | None = None, limi
                 break
             city = j.get("job_city") or ""
             country = j.get("job_country") or "India"
-            loc = ", ".join(x for x in [city, country] if x) or "India"
+            loc = ", ".join(x for x in [city, country] if x) or place
+            apply_url = j.get("job_apply_link") or j.get("job_google_link") or "#"
             out.append(
                 _job_record(
                     role_category=role_category,
                     company_name=j.get("employer_name") or "Hiring Company",
                     job_title=j.get("job_title") or role_category,
                     location=loc,
-                    redirect_url=j.get("job_apply_link") or j.get("job_google_link") or "#",
+                    redirect_url=apply_url,
                     employment_type=j.get("job_employment_type") or "Full-time",
                     source="JSearch",
+                    tags=[str(x) for x in (j.get("job_required_skills") or []) if x][:12],
+                    description=str(j.get("job_description") or "")[:600],
                 )
             )
     except Exception as exc:
@@ -238,10 +539,16 @@ def fetch_jsearch_jobs(role_category: str, skills: list[str] | None = None, limi
     return out[:limit]
 
 
-def fetch_adzuna_jobs(role_category: str, skills: list[str] | None = None, limit: int = JOBS_PER_ROLE) -> list[dict[str, Any]]:
+def fetch_adzuna_jobs(
+    role_category: str,
+    skills: list[str] | None = None,
+    limit: int = JOBS_PER_ROLE,
+    location: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     if not (_is_real_key(ADZUNA_APP_ID) and _is_real_key(ADZUNA_APP_KEY)):
         return []
     out: list[dict[str, Any]] = []
+    where = (location or {}).get("city") or "India"
     try:
         r = requests.get(
             "https://api.adzuna.com/v1/api/jobs/in/search/1",
@@ -249,6 +556,7 @@ def fetch_adzuna_jobs(role_category: str, skills: list[str] | None = None, limit
                 "app_id": ADZUNA_APP_ID,
                 "app_key": ADZUNA_APP_KEY,
                 "what": f"{role_category} {' '.join((skills or [])[:4])}",
+                "where": where,
                 "results_per_page": limit,
             },
             timeout=JOB_API_TIMEOUT,
@@ -259,7 +567,7 @@ def fetch_adzuna_jobs(role_category: str, skills: list[str] | None = None, limit
                 break
             company = (j.get("company") or {}).get("display_name") or "Hiring Company"
             loc_obj = j.get("location") or {}
-            loc = loc_obj.get("display_name") or "India"
+            loc = loc_obj.get("display_name") or where
             out.append(
                 _job_record(
                     role_category=role_category,
@@ -269,6 +577,7 @@ def fetch_adzuna_jobs(role_category: str, skills: list[str] | None = None, limit
                     redirect_url=j.get("redirect_url") or "#",
                     employment_type=j.get("contract_type") or "Full-time",
                     source="Adzuna",
+                    description=str(j.get("description") or "")[:600],
                 )
             )
     except Exception as exc:
@@ -276,30 +585,241 @@ def fetch_adzuna_jobs(role_category: str, skills: list[str] | None = None, limit
     return out[:limit]
 
 
-def fetch_india_jobs_for_role(role_category: str, skills: list[str] | None = None, limit: int = JOBS_PER_ROLE) -> list[dict[str, Any]]:
+# ---------------------------------------------------------------------------
+# Free, no-key job providers. These require NO API key so live openings are
+# available out of the box. They are remote/global-friendly boards; the keyed
+# providers above give India-specific results when configured.
+# ---------------------------------------------------------------------------
+_FREE_HTTP_HEADERS = {"User-Agent": "ResumeNavigator/1.0 (+job-aggregator)", "Accept": "application/json"}
+
+
+def fetch_remotive_jobs(role_category: str, skills: list[str] | None = None, limit: int = JOBS_PER_ROLE, location: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    skill_query = " ".join((skills or [])[:3])
+    place = (location or {}).get("city") or ""
+    search = f"{role_category} {skill_query} {place}".strip()
+    try:
+        r = requests.get(
+            "https://remotive.com/api/remote-jobs",
+            params={"search": search or role_category, "limit": max(limit, 20)},
+            headers=_FREE_HTTP_HEADERS,
+            timeout=JOB_API_TIMEOUT,
+        )
+        r.raise_for_status()
+        for j in (r.json().get("jobs") or []):
+            if len(out) >= limit:
+                break
+            tags = list(j.get("tags") or [])
+            out.append(
+                _job_record(
+                    role_category=role_category,
+                    company_name=j.get("company_name") or "Hiring Company",
+                    job_title=j.get("title") or role_category,
+                    location=j.get("candidate_required_location") or "Remote",
+                    redirect_url=j.get("url") or "#",
+                    employment_type=(j.get("job_type") or "Full-time").replace("_", " ").title(),
+                    source="Remotive",
+                    tags=tags,
+                    description=str(j.get("description") or "")[:600],
+                )
+            )
+    except Exception as exc:
+        _log(f"[Remotive] {type(exc).__name__}: {exc!r}")
+    return out[:limit]
+
+
+def fetch_arbeitnow_jobs(role_category: str, skills: list[str] | None = None, limit: int = JOBS_PER_ROLE, location: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    terms = [role_category.lower()] + [s.lower() for s in (skills or [])[:3]]
+    if location and location.get("aliases"):
+        terms.extend(list(location["aliases"])[:3])
+    try:
+        r = requests.get(
+            "https://www.arbeitnow.com/api/job-board-api",
+            headers=_FREE_HTTP_HEADERS,
+            timeout=JOB_API_TIMEOUT,
+        )
+        r.raise_for_status()
+        for j in (r.json().get("data") or []):
+            if len(out) >= limit:
+                break
+            haystack = f"{j.get('title', '')} {' '.join(j.get('tags') or [])} {j.get('location', '')}".lower()
+            if not any(t and t in haystack for t in terms):
+                continue
+            loc = j.get("location") or ("Remote" if j.get("remote") else "On-site")
+            out.append(
+                _job_record(
+                    role_category=role_category,
+                    company_name=j.get("company_name") or "Hiring Company",
+                    job_title=j.get("title") or role_category,
+                    location=loc,
+                    redirect_url=j.get("url") or "#",
+                    employment_type=", ".join(j.get("job_types") or []).title() or "Full-time",
+                    source="Arbeitnow",
+                    tags=list(j.get("tags") or []),
+                    description=str(j.get("description") or "")[:600],
+                )
+            )
+    except Exception as exc:
+        _log(f"[Arbeitnow] {type(exc).__name__}: {exc!r}")
+    return out[:limit]
+
+
+def fetch_remoteok_jobs(role_category: str, skills: list[str] | None = None, limit: int = JOBS_PER_ROLE, location: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    terms = [role_category.lower()] + [s.lower() for s in (skills or [])[:3]]
+    if location and location.get("aliases"):
+        terms.extend(list(location["aliases"])[:3])
+    try:
+        r = requests.get("https://remoteok.com/api", headers=_FREE_HTTP_HEADERS, timeout=JOB_API_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        rows = data[1:] if isinstance(data, list) else []
+        for j in rows:
+            if len(out) >= limit:
+                break
+            if not isinstance(j, dict):
+                continue
+            haystack = f"{j.get('position', '')} {' '.join(j.get('tags') or [])} {j.get('location', '')}".lower()
+            if not any(t and t in haystack for t in terms):
+                continue
+            out.append(
+                _job_record(
+                    role_category=role_category,
+                    company_name=j.get("company") or "Hiring Company",
+                    job_title=j.get("position") or role_category,
+                    location=j.get("location") or "Remote",
+                    redirect_url=j.get("url") or j.get("apply_url") or "#",
+                    employment_type="Remote",
+                    source="RemoteOK",
+                    tags=list(j.get("tags") or []),
+                    description=str(j.get("description") or "")[:600],
+                )
+            )
+    except Exception as exc:
+        _log(f"[RemoteOK] {type(exc).__name__}: {exc!r}")
+    return out[:limit]
+
+
+def build_search_fallback_jobs(
+    role_category: str,
+    skills: list[str] | None = None,
+    location: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Location-scoped portal searches — used only as a last-resort browse aid.
+
+    These are NOT treated as direct-apply openings in the main feed.
+    """
+    top_skills = [s for s in (skills or []) if s][:3]
+    place = (location or {}).get("query") or (location or {}).get("city") or "India"
+    query = " ".join([role_category] + top_skills).strip()
+    q = urllib.parse.quote_plus(query)
+    place_q = urllib.parse.quote_plus(place)
+    slug = urllib.parse.quote(query.lower().replace(" ", "-"))
+    city_slug = urllib.parse.quote(str((location or {}).get("city") or "india").lower().replace(" ", "-"))
+    portals = [
+        ("LinkedIn", f"https://www.linkedin.com/jobs/search/?keywords={q}&location={place_q}"),
+        ("Naukri", f"https://www.naukri.com/{slug}-jobs-in-{city_slug}"),
+        ("Indeed", f"https://in.indeed.com/jobs?q={q}&l={place_q}"),
+        ("Foundit", f"https://www.foundit.in/srp/results?query={q}&locations={place_q}"),
+        ("Google Jobs", f"https://www.google.com/search?q={q}+jobs+in+{place_q}&ibp=htl;jobs"),
+    ]
+    return [
+        _job_record(
+            role_category=role_category,
+            company_name=name,
+            job_title=f"{role_category} openings",
+            location=place,
+            redirect_url=url,
+            employment_type="Search",
+            source=f"{name} search",
+        )
+        for name, url in portals
+    ]
+
+
+_INDIA_LOCATION_TOKENS = (
+    "india", "bengaluru", "bangalore", "mumbai", "delhi", "chennai", "hyderabad",
+    "pune", "kolkata", "noida", "gurugram", "gurgaon", "ahmedabad", "jaipur",
+    "kochi", "chandigarh", "indore", "coimbatore", "thiruvananthapuram", "remote, in",
+)
+_REMOTE_WORLDWIDE_TOKENS = (
+    "worldwide", "anywhere", "global", "remote - global", "remote", "work from home",
+    "wfh", "distributed", "utc", "timezone",
+)
+_FOREIGN_ONLY_TOKENS = (
+    "usa only", "us only", "united states only", "uk only", "europe only",
+    "eu only", "canada only", "australia only", "germany only", "visa sponsorship required",
+)
+
+
+def _india_location_rank(location: str) -> int | None:
+    """Rank a job's location for India relevance.
+
+    Returns 0 for India-based, 1 for worldwide-remote (an Indian can apply), or
+    None when the listing is clearly restricted to another country/region.
+    """
+    loc = (location or "").lower().strip()
+    if not loc:
+        return 1  # unknown remote board location — treat as globally applicable
+    if any(tok in loc for tok in _FOREIGN_ONLY_TOKENS):
+        return None
+    if any(tok in loc for tok in _INDIA_LOCATION_TOKENS):
+        return 0
+    if any(tok in loc for tok in _REMOTE_WORLDWIDE_TOKENS):
+        return 1
+    # Single country labels without India — skip; multi-region / vague keep as remote-eligible.
+    if re.search(r"\b(usa|united states|uk|united kingdom|germany|france|canada|australia|europe|eu)\b", loc):
+        if "india" not in loc and "asia" not in loc:
+            return None
+    return 1
+
+
+def fetch_india_jobs_for_role(
+    role_category: str,
+    skills: list[str] | None = None,
+    limit: int = JOBS_PER_ROLE,
+    location: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     seen: set[str] = set()
-    merged: list[dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [
-            pool.submit(fetch_jsearch_jobs, role_category, skills, limit),
-            pool.submit(fetch_adzuna_jobs, role_category, skills, limit),
-        ]
+    india_jobs: list[dict[str, Any]] = []
+    # Keyed providers already query the candidate city when provided.
+    providers = [
+        (fetch_jsearch_jobs, True),
+        (fetch_adzuna_jobs, True),
+        (fetch_remotive_jobs, False),
+        (fetch_arbeitnow_jobs, False),
+        (fetch_remoteok_jobs, False),
+    ]
+    with ThreadPoolExecutor(max_workers=len(providers)) as pool:
+        futures = {
+            pool.submit(fn, role_category, skills, limit, location): scoped
+            for fn, scoped in providers
+        }
         for future in as_completed(futures):
-            for job in future.result():
+            try:
+                results = future.result()
+            except Exception as exc:
+                _log(f"[jobs] provider error: {exc!r}")
+                results = []
+            for job in results:
                 url = job.get("redirect_url") or ""
-                if url in seen or url == "#":
+                if url in seen or url == "#" or not _is_direct_apply_job(job):
+                    continue
+                if not _job_matches_candidate_location(job, location):
                     continue
                 seen.add(url)
-                merged.append(job)
-                if len(merged) >= limit:
-                    return merged[:limit]
-    return merged[:limit]
+                india_jobs.append(job)
+
+    # Direct-apply only — never inject portal "Search" cards into the apply feed.
+    return _annotate_and_rank_jobs(india_jobs, skills)[:limit]
 
 
 def fetch_jobs_for_roles(
     roles: list[str],
     skills: list[str] | None = None,
     per_role_limit: int = JOBS_PER_ROLE,
+    location: dict[str, Any] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     role_names = [str(role).strip() for role in roles if str(role).strip()][:MAX_JOB_ROLES]
     if not role_names:
@@ -307,13 +827,13 @@ def fetch_jobs_for_roles(
     grouped: dict[str, list[dict[str, Any]]] = {}
     with ThreadPoolExecutor(max_workers=min(len(role_names), 5)) as pool:
         futures = {
-            pool.submit(fetch_india_jobs_for_role, role_name, skills, per_role_limit): role_name
+            pool.submit(fetch_india_jobs_for_role, role_name, skills, per_role_limit, location): role_name
             for role_name in role_names
         }
         for future in as_completed(futures):
             role_name = futures[future]
             grouped[role_name] = future.result()
-    return grouped
+        return grouped
 
 
 def _heuristic_is_resume(text: str) -> bool:
@@ -350,47 +870,44 @@ def _heuristic_is_resume(text: str) -> bool:
 
 
 def _build_scorecard(
-    resume_text: str, matched_skills: list[str], missing_skills: list[str], domain: str
+    resume_text: str,
+    matched_skills: list[str],
+    missing_skills: list[str],
+    domain: str,
+    job_description: str | None = None,
 ) -> dict[str, Any]:
-    """Return a reproducible, evidence-based ATS score instead of a random number.
+    """Return an explainable, multi-signal ATS scorecard via the NLP engine.
 
-    This intentionally evaluates only signals that are observable in the uploaded text.
-    It is a screening-readiness indicator, not a promise of a hiring outcome.
+    Delegates to ``nlp_engine.compute_ats`` which blends semantic skill matching
+    (embeddings + ontology + fuzzy), spaCy/regex structure detection, readability
+    and grammar analysis into a weighted score. Everything degrades gracefully
+    when the ML stack is not installed, so the endpoint never fails on scoring.
     """
-    lower = resume_text.lower()
-    words = re.findall(r"\b[\w+#./-]+\b", resume_text)
-    lines = [line.strip() for line in resume_text.splitlines() if line.strip()]
     profile = DOMAIN_PROFILES.get(domain, {})
-    skill_pool = profile.get("skill_pool", [])
-    has = lambda terms: any(term in lower for term in terms)
-    skill_coverage = min(1.0, len(matched_skills) / max(5, min(12, len(skill_pool))))
-    quantified = len(re.findall(r"\b\d+(?:[.,]\d+)?\s*(?:%|x|users|customers|projects|days|hours|lakhs|crore)\b", lower))
-    action_verbs = len(re.findall(r"\b(built|led|created|delivered|improved|designed|developed|managed|launched|optimized|implemented|automated|analyzed)\b", lower))
-    sections = sum(has([name]) for name in ("summary", "experience", "education", "skills", "project", "certification", "achievement"))
-    bullets = sum(1 for line in lines if re.match(r"^(?:[-•*]|\d+[.)])\s+", line))
-    sentence_lengths = [len(re.findall(r"\w+", s)) for s in re.split(r"[.!?\n]+", resume_text) if s.strip()]
-    avg_sentence = sum(sentence_lengths) / max(1, len(sentence_lengths))
-    readability = max(0, min(100, round(88 - max(0, avg_sentence - 18) * 2.2 - (8 if len(words) < 180 else 0))))
-    values = {
-        "Formatting": min(100, 35 + sections * 8 + min(12, bullets)),
-        "Technical skills": round(25 + skill_coverage * 75),
-        "Experience": min(100, 30 + (28 if has(["experience", "employment", "work history", "internship"]) else 0) + min(24, quantified * 6 + action_verbs * 2)),
-        "Projects": min(100, 25 + (35 if has(["projects", "project"]) else 0) + min(30, quantified * 5 + action_verbs * 2)),
-        "Education": 82 if has(["education", "university", "college", "b.tech", "b.e", "b.sc", "b.com", "mba"]) else 30,
-        "Achievements": min(100, 25 + (30 if has(["achievement", "award", "winner", "certification"]) else 0) + min(25, quantified * 5)),
-        "Readability": readability,
-        "Recruiter impression": min(100, 28 + sections * 7 + min(28, action_verbs * 3 + quantified * 4) + round(skill_coverage * 16)),
-    }
-    weights = {"Formatting": .12, "Technical skills": .22, "Experience": .18, "Projects": .14, "Education": .08, "Achievements": .08, "Readability": .08, "Recruiter impression": .10}
-    overall = round(sum(values[key] * weights[key] for key in values))
-    evidence = [
-        f"{len(matched_skills)} relevant skills mapped to the {domain} profile",
-        f"{sections}/7 core resume sections detected",
-        f"{action_verbs} action verbs and {quantified} quantified outcomes detected",
-    ]
-    if missing_skills:
-        evidence.append("Priority gaps: " + ", ".join(missing_skills[:3]))
-    return {"overall": max(0, min(100, overall)), "sections": values, "evidence": evidence}
+    required = list(profile.get("skill_pool", []))
+    # Ensure the resume's own detected skills are represented in the target set
+    for skill in matched_skills:
+        if skill.lower() not in {r.lower() for r in required}:
+            required.append(skill)
+    try:
+        return compute_ats(resume_text, domain, matched_skills, required, job_description)
+    except Exception as exc:  # pragma: no cover - defensive last resort
+        _log(f"[scorecard] engine failed, using minimal fallback: {exc!r}")
+        cov = min(1.0, len(matched_skills) / max(5, min(12, len(required))))
+        overall = round(40 + cov * 45)
+        return {
+            "overall": max(0, min(100, overall)),
+            "sections": {"Skill Match": round(20 + cov * 80), "Resume Structure": 60,
+                          "Experience": 55, "Projects": 55, "Education": 60,
+                          "Formatting": 65, "Achievements": 50, "Grammar": 70},
+            "weights": {},
+            "confidence": {"value": 40, "basis": "Minimal fallback scorer."},
+            "recruiter_readiness": overall, "interview_probability": max(5, overall - 15),
+            "hiring_confidence": max(5, overall - 25),
+            "evidence": [f"{len(matched_skills)} skills matched to the {domain} profile."],
+            "weak_areas": [], "features": {}, "semantic_missing_skills": missing_skills[:8],
+            "engine": engine_capabilities(),
+        }
 
 
 def _extract_resume_sections(resume_text: str) -> dict[str, str]:
@@ -426,8 +943,10 @@ def _build_career_intelligence(
     """
     sections = _extract_resume_sections(resume_text)
     score_sections = scorecard.get("sections", {})
+    features = scorecard.get("features", {})
+    readability_score = (features.get("readability") or {}).get("score", score_sections.get("Grammar", 60))
     attention = []
-    section_score_key = {"summary": "Recruiter impression", "experience": "Experience", "education": "Education", "skills": "Technical skills", "projects": "Projects", "achievements": "Achievements"}
+    section_score_key = {"summary": "Resume Structure", "experience": "Experience", "education": "Education", "skills": "Skill Match", "projects": "Projects", "achievements": "Achievements"}
     for name, content in sections.items():
         if not content:
             status, reason = "low", "No clearly labeled section was detected."
@@ -463,7 +982,7 @@ def _build_career_intelligence(
             "best_domains": [domain],
             "leadership_signal": min(100, 25 + action_count * 5),
             "innovation_signal": min(100, 20 + (18 if sections["projects"] else 0) + action_count * 3),
-            "communication_signal": score_sections.get("Readability", 0),
+            "communication_signal": readability_score,
             "learning_signal": min(100, 25 + len(matched) * 5 + (15 if sections["achievements"] else 0)),
             "note": "Signals are based on written evidence in this resume, not personality inference.",
         },
@@ -514,11 +1033,17 @@ def _build_domain_analysis(resume_text: str) -> dict[str, Any]:
         score = sum(1 for t in role_tokens if t in lower) + len(matched)
         role_scores.append((role, score))
     role_scores.sort(key=lambda item: item[1], reverse=True)
-    predicted_role = role_scores[0][0]
+
+    # Fallback role prediction: TF-IDF feature vectors + Logistic Regression classifier.
+    ml_role = predict_job_role(text, matched)
+    if ml_role.get("available") and ml_role.get("predicted_role"):
+        predicted_role = str(ml_role["predicted_role"])
+    else:
+        predicted_role = role_scores[0][0]
     domain_roles = [r for r, _ in role_scores[:5]]
     skill_roles = infer_roles_from_skills(matched, domain)
     recommended_roles = merge_recommended_roles(
-        [predicted_role] + domain_roles,
+        [predicted_role] + ([ml_role["predicted_role"]] if ml_role.get("predicted_role") else []) + domain_roles,
         skill_roles,
         limit=6,
     )
@@ -697,7 +1222,15 @@ def analyze_resume(text: str) -> dict[str, Any]:
             raise
         except Exception as exc:
             _log(f"[analyze] Gemini unavailable, using heuristic analyzer: {exc!r}")
-    return _build_domain_analysis(text)
+    result = _build_domain_analysis(text)
+    if isinstance(result, dict) and "error" not in result:
+        result["_heuristic"] = True
+        # Attach TF-IDF + LR prediction metadata for the analyze response.
+        result["ml_role_prediction"] = predict_job_role(
+            text,
+            result.get("matched_skills") or [],
+        )
+    return result
 
 
 _LOCATION_MARKERS = (
@@ -796,24 +1329,62 @@ def _extract_candidate_details(resume_text: str) -> dict[str, str]:
             college = ln
             break
 
+    location_profile = _extract_candidate_location(resume_text)
     return {
         "candidate_name": probable_name,
         "candidate_email": email,
         "candidate_phone": phone,
         "candidate_college": college,
+        "candidate_location": (location_profile or {}).get("display") or "Not found",
+        "candidate_location_query": (location_profile or {}).get("query") or "",
     }
 
 
-def _build_jobs_payload(recommended_roles: list[str], matched_skills: list[str] | None = None) -> dict[str, Any]:
-    skills = [str(skill).strip() for skill in (matched_skills or []) if str(skill).strip()][:8]
-    jobs_by_role = fetch_jobs_for_roles(recommended_roles, skills, JOBS_PER_ROLE)
+def _build_jobs_payload(
+    recommended_roles: list[str],
+    matched_skills: list[str] | None = None,
+    jobs_per_role: int = JOBS_PER_ROLE,
+    candidate_location: str | dict[str, Any] | None = None,
+    resume_text: str | None = None,
+) -> dict[str, Any]:
+    skills = [str(skill).strip() for skill in (matched_skills or []) if str(skill).strip()]
+    if isinstance(candidate_location, dict):
+        location = candidate_location
+    else:
+        location = _resolve_location_profile(candidate_location) if candidate_location else None
+    if location is None and resume_text:
+        location = _extract_candidate_location(resume_text)
+
+    jobs_by_role = fetch_jobs_for_roles(recommended_roles, skills, jobs_per_role, location)
     total = sum(len(v) for v in jobs_by_role.values())
     provider = jobs_provider_status()
-    message = None
-    if not provider["any_provider"]:
-        message = "Live job listings are temporarily unavailable. Please try again shortly."
-    elif total == 0:
-        message = "No active India listings found for your roles right now. Try again shortly."
+    city = (location or {}).get("display")
+    portal_searches = []
+    if recommended_roles:
+        portal_searches = build_search_fallback_jobs(recommended_roles[0], skills, location)
+
+    if total == 0:
+        if city:
+            message = (
+                f"No direct-apply openings found in {city} for your matched skills right now. "
+                f"Use the location-scoped portal links below, or add a JSearch/Adzuna key in backend/.env."
+            )
+        else:
+            message = (
+                "No city/address was detected on your resume, and no India direct-apply listings matched. "
+                "Add a city (e.g. Bengaluru, Mumbai) to your resume contact section and re-analyze."
+            )
+    elif city:
+        message = (
+            f"Showing only direct-apply openings in {city} (from your resume address), "
+            "ranked by overlap with your matched skills. Apply Now opens the employer application page."
+        )
+    else:
+        message = (
+            "Showing India-based direct-apply openings ranked by your matched skills. "
+            "Add a city to your resume to narrow results to your address."
+        )
+
     return {
         "jobs_by_role": jobs_by_role,
         "jobs": jobs_by_role.get(recommended_roles[0], []) if recommended_roles else [],
@@ -821,6 +1392,8 @@ def _build_jobs_payload(recommended_roles: list[str], matched_skills: list[str] 
         "jobs_provider": provider,
         "jobs_message": message,
         "job_search_skills": skills,
+        "candidate_location": city or "Not found",
+        "portal_searches": portal_searches,
     }
 
 
@@ -831,17 +1404,107 @@ def root():
         "health": "/health",
         "analyze": "POST /analyze",
         "fetch_jobs": "POST /api/fetch-jobs",
+        "algorithms": "GET /api/algorithms",
+    }
+
+
+@app.get("/api/algorithms")
+def api_algorithms():
+    """Document the academic algorithm stack and live availability."""
+    caps = engine_capabilities()
+    ml = role_predictor_status()
+    return {
+        "algorithms": [
+            {
+                "id": "nlp",
+                "name": "Natural Language Processing (NLP)",
+                "phase": "Parsing",
+                "used": True,
+                "modules": ["resume_nlp.py", "pdf_parser.py", "skills.py"],
+                "description": (
+                    "Extracts unstructured text from PDF and Word (.docx) resumes, cleans it, "
+                    "and extracts skills, academic degrees, and years of experience via rules and regex."
+                ),
+            },
+            {
+                "id": "tfidf",
+                "name": "TF-IDF (Term Frequency–Inverse Document Frequency)",
+                "phase": "Feature extraction",
+                "used": bool(ml.get("available")),
+                "modules": ["role_predictor.py", "nlp_engine.py"],
+                "description": (
+                    "Converts resume skills and phrases into numerical feature vectors for ML classification "
+                    "and document relevance scoring."
+                ),
+            },
+            {
+                "id": "logistic_regression",
+                "name": "Logistic Regression",
+                "phase": "Role classification",
+                "used": bool(ml.get("available")),
+                "modules": ["role_predictor.py", "role_model.pkl"],
+                "description": (
+                    "Classifies the resume to predict the applicant's target career role "
+                    "(e.g. Machine Learning Engineer, Data Analyst, Full Stack Developer, DevOps Engineer)."
+                ),
+                "classes": ml.get("classes") or [],
+            },
+            {
+                "id": "sentence_transformers_cosine",
+                "name": "Sentence Transformers & Cosine Similarity",
+                "phase": "Semantic matching",
+                "used": bool(caps.get("embeddings")),
+                "modules": ["nlp_engine.py"],
+                "description": (
+                    "Encodes resumes and job descriptions into dense embeddings and computes cosine similarity "
+                    "for precise match scores and skill-gap analysis."
+                ),
+                "embedding_model": caps.get("embedding_model"),
+            },
+            {
+                "id": "gemini_llm",
+                "name": "Generative Artificial Intelligence (Gemini LLM)",
+                "phase": "Intelligence & roadmap",
+                "used": _genai_client is not None,
+                "modules": ["main.py"],
+                "model": "gemini-2.5-flash",
+                "description": (
+                    "Validates uploads, produces domain-aware ATS narrative and role realism checks, "
+                    "and generates personalized milestone roadmaps as structured JSON."
+                ),
+            },
+        ],
+        "docs": "See ALGORITHMS.md in the project root.",
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "jobs_provider": jobs_provider_status()}
+    caps = engine_capabilities()
+    ml = role_predictor_status()
+    return {
+        "status": "ok",
+        "jobs_provider": jobs_provider_status(),
+        "nlp_engine": caps,
+        "gemini_enabled": _genai_client is not None,
+        "role_predictor": ml,
+        "algorithms": {
+            "nlp_parsing": True,
+            "tfidf": bool(ml.get("available")),
+            "logistic_regression": bool(ml.get("available")),
+            "sentence_transformers_cosine": bool(caps.get("embeddings")),
+            "gemini_llm": _genai_client is not None,
+        },
+    }
 
 
 @app.get("/analyze")
 def analyze_get_info():
-    return {"detail": "Use POST with multipart form field 'file' (PDF).", "field": "file"}
+    return {
+        "detail": "Use POST with multipart form field 'file' (PDF or DOCX).",
+        "field": "file",
+        "accepted": sorted(SUPPORTED_RESUME_EXTENSIONS),
+    }
 
 
 @app.get("/api/analyze")
@@ -854,8 +1517,50 @@ def api_fetch_jobs(body: FetchJobsRequest):
     roles = [str(r).strip() for r in (body.recommended_roles or []) if str(r).strip()][:5]
     if not roles:
         raise HTTPException(status_code=400, detail="recommended_roles must be a non-empty list.")
-    payload = _build_jobs_payload(roles)
+    payload = _build_jobs_payload(
+        roles,
+        body.matched_skills,
+        body.jobs_per_role,
+        candidate_location=body.candidate_location,
+    )
     return {"recommended_roles": roles, **payload}
+
+
+# In-memory application log for the session (also written when Mongo is available).
+_APPLICATIONS: list[dict[str, Any]] = []
+
+
+@app.post("/api/apply")
+def api_apply_job(body: ApplyJobRequest):
+    """Mark that the user is applying to a skill-matched opening (opens external apply URL)."""
+    url = (body.redirect_url or "").strip()
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="redirect_url must be an http(s) apply link.")
+    record = {
+        "id": uuid.uuid4().hex,
+        "job_title": body.job_title.strip(),
+        "company_name": (body.company_name or "Hiring Company").strip(),
+        "redirect_url": url,
+        "role_category": (body.role_category or "").strip() or None,
+        "skill_match_pct": body.skill_match_pct,
+        "matched_skills": [str(s).strip() for s in (body.matched_skills or []) if str(s).strip()][:12],
+        "candidate_name": (body.candidate_name or "").strip() or None,
+        "candidate_email": (body.candidate_email or "").strip() or None,
+        "status": "applied",
+        "applied_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _APPLICATIONS.append(record)
+    try:
+        from database import save_candidate  # type: ignore
+        save_candidate({"type": "job_application", **record})
+    except Exception:
+        pass
+    return {"ok": True, "application": record, "message": "Application started — complete it on the employer portal."}
+
+
+@app.get("/api/applications")
+def api_list_applications():
+    return {"applications": list(reversed(_APPLICATIONS[-50:])), "count": len(_APPLICATIONS)}
 
 
 @app.post("/api/intelligence")
@@ -864,112 +1569,242 @@ def career_intelligence(body: ResumeTextRequest):
     return _analyze_text_intelligence(body.resume_text)
 
 
+@app.post("/api/role-analysis")
+def role_analysis(body: RoleAnalysisRequest):
+    """Analyze resume skills against a user-specified target role and surface openings."""
+    text = _normalize_resume_text(body.resume_text)
+    if not _heuristic_is_resume(text):
+        raise HTTPException(status_code=422, detail=INVALID_RESUME_ERROR)
+    domain = detect_domain(text)
+    metadata = _extract_candidate_details(text)
+    matched = sanitize_skills(extract_professional_skills(text, domain), metadata)
+    result = analyze_for_target_role(matched, body.target_role)
+    # Pull live openings for the explored role using skills the candidate already has.
+    role_name = str(result.get("matched_role") or body.target_role).strip()
+    have = result.get("skills_you_have") or matched
+    jobs_payload = _build_jobs_payload(
+        [role_name],
+        have,
+        jobs_per_role=min(12, JOBS_PER_ROLE),
+        resume_text=text,
+        candidate_location=metadata.get("candidate_location"),
+    )
+    result.update(jobs_payload)
+    return result
+
+
 @app.post("/api/job-match")
 def job_match(body: JobMatchRequest):
     """Explain a resume-to-job match using normalized skills and document evidence."""
-    analysis = _analyze_text_intelligence(body.resume_text)
+    text = _normalize_resume_text(body.resume_text)
+    if not _heuristic_is_resume(text):
+        raise HTTPException(status_code=422, detail=INVALID_RESUME_ERROR)
     jd = _normalize_resume_text(body.job_description)
+    domain = detect_domain(text)
     jd_domain = detect_domain(jd)
     jd_skills = sanitize_skills(extract_professional_skills(jd, jd_domain), {})
-    resume_lower = body.resume_text.lower()
-    matched = [skill for skill in jd_skills if skill.lower() in resume_lower]
-    missing = [skill for skill in jd_skills if skill not in matched]
-    skill_score = round(100 * len(matched) / max(1, len(jd_skills)))
-    relevance_bonus = 10 if analysis["domain"] == jd_domain else 0
-    match_score = min(100, round(skill_score * .75 + analysis["scorecard"]["sections"].get("Readability", 0) * .15 + relevance_bonus))
+    # Score the resume against the job description directly (semantic).
+    matched = sanitize_skills(extract_professional_skills(text, domain), {})
+    missing = compute_missing_skills(matched, domain)
+    scorecard = _build_scorecard(text, matched, missing, domain, job_description=jd)
+    report = semantic_match_skills(text, jd_skills)
+    matched_jd = [m["skill"] for m in report["matched"]]
+    missing_jd = [m["skill"] for m in report["missing"]]
+    jd_rel = scorecard.get("jd_relevance")
     return {
         "target_role": body.target_role or "Target role",
-        "match_score": match_score,
+        "match_score": scorecard["sections"].get("Skill Match", scorecard["overall"]),
+        "overall_ats": scorecard["overall"],
+        "confidence": scorecard.get("confidence"),
+        "jd_relevance_pct": round((jd_rel or 0) * 100) if jd_rel is not None else None,
         "score_explanation": [
-            f"{len(matched)} of {len(jd_skills)} skills extracted from the job description are evidenced in the resume.",
-            f"Resume domain: {analysis['domain']}; job-description domain: {jd_domain}.",
-            "Score combines skill coverage, readability, and domain alignment; it is not a hiring prediction.",
-        ],
-        "matched_skills": matched,
-        "missing_skills": missing,
-        "resume_scorecard": analysis["scorecard"],
+            f"{len(matched_jd)} of {len(jd_skills)} job-description skills are evidenced in the resume (semantic + ontology matching).",
+            f"Resume domain: {domain}; job-description domain: {jd_domain}.",
+            (f"Overall resume/JD semantic relevance: {round((jd_rel or 0)*100)}%." if jd_rel is not None else
+             "Semantic embeddings unavailable — using ontology + keyword relevance."),
+        ] + scorecard.get("evidence", [])[:2],
+        "matched_skills": matched_jd,
+        "missing_skills": missing_jd,
+        "matched_skill_details": report["matched"],
+        "resume_scorecard": scorecard,
     }
 
 
-async def _analyze_impl(file: UploadFile) -> dict[str, Any]:
+async def _analyze_impl(file: UploadFile, job_description: str | None = None) -> dict[str, Any]:
     fname = (file.filename or "").lower()
-    if not fname.endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF uploads are supported.")
-    internal = f"{uuid.uuid4().hex}.pdf"
+    suffix = Path(fname).suffix.lower()
+    if suffix not in SUPPORTED_RESUME_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Only PDF and Word (.docx) resumes are supported.",
+        )
+    content = await file.read()
+    if len(content) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Resume file too large (max 8 MB).")
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    internal = f"{uuid.uuid4().hex}{suffix}"
     path = os.path.join(UPLOAD_DIR, internal)
     try:
         with open(path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+            buffer.write(content)
 
         try:
-            text = _normalize_resume_text(extract_pdf_text(path))
+            from services.analysis_pipeline import run_full_analysis
+            pipeline = run_full_analysis(file_path=path, job_description=job_description)
+        except ValueError as ve:
+            return JSONResponse(status_code=422, content={"error": str(ve)})
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"PDF read error: {type(e).__name__}")
-        if not text:
-            return JSONResponse(status_code=422, content={"error": INVALID_PDF_TEXT_ERROR})
+            _log(f"[pipeline] {type(e).__name__}: {e!r}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Analysis pipeline failed: {type(e).__name__}: {e}",
+            ) from e
 
-        ai = analyze_resume(text)
-        if ai.get("error"):
-            return JSONResponse(
-                status_code=422,
-                content={"error": ai["error"]},
-            )
+        resume = pipeline.get("resume") or {}
+        role_prediction = pipeline.get("role_prediction") or {}
+        semantic = pipeline.get("semantic_analysis") or {}
+        ats_analysis = pipeline.get("ats_analysis") or {}
+        ai = pipeline.get("ai_analysis") or {}
+        text = pipeline.get("resume_text") or ""
 
-        role = str(ai.get("predicted_role") or "Graduate Trainee").strip()
-        details = _extract_candidate_details(text)
-        domain = str(ai.get("detected_domain") or detect_domain(text)).strip()
-        matched = sanitize_skills(
-            [str(s).strip() for s in (ai.get("matched_skills") or []) if s],
-            details,
-        )
-        if not matched:
-            matched = sanitize_skills(extract_professional_skills(text, domain), details)
-        skill_roles = infer_roles_from_skills(matched, domain)
+        matched = list(semantic.get("matched_skills") or resume.get("skills") or [])[:24]
+        missing = list(semantic.get("missing_skills") or ai.get("missing_skills") or [])[:16]
+        role = str(pipeline.get("realistic_role") or pipeline.get("predicted_role") or "Graduate Trainee")
+        ml_role_name = str(role_prediction.get("predicted_role") or role)
         recommended_roles = merge_recommended_roles(
-            [role] + [str(x).strip() for x in (ai.get("recommended_roles") or []) if str(x).strip()],
-            skill_roles,
+            [role, ml_role_name]
+            + [a.get("role") for a in (role_prediction.get("alternative_roles") or []) if a.get("role")],
+            infer_roles_from_skills(matched, resume.get("detected_domain") or detect_domain(text)),
             limit=6,
         )
-        if not recommended_roles:
-            recommended_roles = [role]
 
-        try:
-            ats = int(ai.get("ats_score", 0))
-        except (TypeError, ValueError):
-            ats = 50
-        ats = max(0, min(100, ats))
-
-        missing = sanitize_skills(
-            [str(s).strip() for s in (ai.get("missing_skills") or []) if s],
-            details,
-        )
-        if not missing:
-            missing = compute_missing_skills(matched, domain)
-        # The final score is always generated from observable resume signals so it
-        # remains explainable even when an LLM is enabled for narrative analysis.
+        domain = str(resume.get("detected_domain") or detect_domain(text))
         scorecard = _build_scorecard(text, matched, missing, domain)
-        ats = scorecard["overall"]
+        ats = int(ats_analysis.get("ats_score") or scorecard.get("overall") or 0)
+        scorecard["overall"] = ats
+        scorecard["pipeline_breakdown"] = ats_analysis.get("score_breakdown")
+
+        loc_details = _extract_candidate_details(text)
+        details = {
+            "candidate_name": resume.get("name") or "Not found",
+            "candidate_email": resume.get("email") or "Not found",
+            "candidate_phone": resume.get("phone") or "Not found",
+            "candidate_college": "Not found",
+            "candidate_location": loc_details.get("candidate_location", "Not found"),
+        }
+        for edu in resume.get("education") or []:
+            if isinstance(edu, dict) and edu.get("raw"):
+                details["candidate_college"] = edu["raw"]
+                break
+
         intelligence = _build_career_intelligence(text, matched, missing, domain, scorecard)
-        jobs_payload = _build_jobs_payload(recommended_roles, matched)
+        jobs_payload = _build_jobs_payload(
+            recommended_roles,
+            matched,
+            resume_text=text,
+            candidate_location=details.get("candidate_location"),
+        )
+
+        learning_roadmap = ai.get("learning_roadmap") or []
+        if learning_roadmap and "step" not in (learning_roadmap[0] or {}):
+            learning_roadmap = [
+                {
+                    "step": item.get("phase", i + 1),
+                    "title": item.get("title", f"Phase {i + 1}"),
+                    "focus": ", ".join(item.get("skills") or []) or item.get("duration", ""),
+                    "project_idea": "; ".join(item.get("projects") or []) or item.get("duration", ""),
+                }
+                for i, item in enumerate(learning_roadmap)
+            ]
+
+        conf = float(role_prediction.get("confidence") or 0)
+        conf_pct = round(conf * 100, 1) if conf <= 1 else round(conf, 1)
+
+        algorithms_used = {
+            "nlp_parsing": {
+                "name": "Natural Language Processing (NLP)",
+                "used": True,
+                "details": "Structured PDF/DOCX parse → name, contact, skills, education, experience, projects",
+            },
+            "tfidf": {
+                "name": "TF-IDF (Term Frequency–Inverse Document Frequency)",
+                "used": True,
+                "details": "Feature extraction for fallback role classification",
+            },
+            "logistic_regression": {
+                "name": "Logistic Regression",
+                "used": bool(role_prediction.get("available")),
+                "details": "Fallback career-role classifier on TF-IDF features",
+                "predicted_role": role_prediction.get("predicted_role"),
+                "confidence": role_prediction.get("confidence"),
+            },
+            "sentence_transformers_cosine": {
+                "name": "Sentence Transformers & Cosine Similarity",
+                "used": bool(semantic.get("available")),
+                "details": "Dense embeddings + mathematical cosine similarity for job match / skill gap",
+                "semantic_match_score": semantic.get("semantic_match_score"),
+                "model": semantic.get("model"),
+            },
+            "gemini_llm": {
+                "name": "Generative AI (Gemini LLM)",
+                "used": ai.get("provider") == "gemini-2.5-flash",
+                "model": "gemini-2.5-flash",
+                "details": "Validation, realistic role, roadmap, milestones (does not replace ML pipeline)",
+            },
+        }
 
         return {
+            "resume": resume,
+            "role_prediction": role_prediction,
+            "semantic_analysis": semantic,
+            "ats_analysis": ats_analysis,
+            "ai_analysis": ai,
             "ats_score": ats,
-            "predicted_role": role,
+            "predicted_role": ml_role_name,
+            "realistic_role": role,
+            "role_prediction_source": "tfidf_logistic_regression",
+            "ml_role_prediction": {
+                "predicted_role": role_prediction.get("predicted_role"),
+                "confidence": conf_pct,
+                "top_roles": [
+                    {
+                        "role": a.get("role"),
+                        "confidence": round(float(a.get("confidence") or 0) * 100, 1)
+                        if float(a.get("confidence") or 0) <= 1
+                        else round(float(a.get("confidence") or 0), 1),
+                    }
+                    for a in (role_prediction.get("alternative_roles") or [])
+                ],
+                "available": role_prediction.get("available"),
+                "algorithm": role_prediction.get("algorithm"),
+            },
             "recommended_roles": recommended_roles,
             "matched_skills": matched,
             "missing_skills": missing,
             "detected_domain": domain,
-            "learning_roadmap": ai.get("learning_roadmap") or [],
-            "custom_suggestion": str(ai.get("custom_suggestion") or "").strip(),
-            "career_suggestions": str(ai.get("career_suggestions") or ai.get("custom_suggestion") or "").strip(),
+            "learning_roadmap": learning_roadmap,
+            "career_milestones": ai.get("career_milestones") or [],
+            "custom_suggestion": str(ai.get("summary") or "").strip(),
+            "career_suggestions": str(ai.get("summary") or "").strip(),
+            "strengths": ai.get("strengths") or [],
+            "weaknesses": ai.get("weaknesses") or [],
+            "resume_improvements": ai.get("resume_improvements") or [],
+            "semantic_match_score": semantic.get("semantic_match_score"),
+            "resume_text": text,
             "keywords": matched[:15],
             "candidate_metadata": details,
             "candidate_name": details.get("candidate_name", "Not found"),
             "candidate_email": details.get("candidate_email", "Not found"),
             "candidate_phone": details.get("candidate_phone", "Not found"),
             "candidate_college": details.get("candidate_college", "Not found"),
+            "candidate_location": details.get("candidate_location", "Not found"),
+            "academic_degrees": resume.get("degrees") or [],
+            "years_of_experience": resume.get("total_experience") or 0,
             "scorecard": scorecard,
             "career_intelligence": intelligence,
+            "algorithms_used": algorithms_used,
             **jobs_payload,
         }
     except HTTPException:
@@ -990,13 +1825,112 @@ async def _analyze_impl(file: UploadFile) -> dict[str, Any]:
 
 
 @app.post("/analyze")
-async def analyze(file: UploadFile = File(..., description="PDF resume")):
-    return await _analyze_impl(file)
+async def analyze(
+    file: UploadFile = File(..., description="PDF or DOCX resume"),
+    job_description: str | None = Form(default=None),
+):
+    return await _analyze_impl(file, job_description)
 
 
 @app.post("/api/analyze")
-async def analyze_compat(file: UploadFile = File(..., description="PDF resume")):
-    return await _analyze_impl(file)
+async def analyze_compat(
+    file: UploadFile = File(..., description="PDF or DOCX resume"),
+    job_description: str | None = Form(default=None),
+):
+    return await _analyze_impl(file, job_description)
+
+
+@app.post("/api/analyze-resume")
+async def api_analyze_resume(
+    file: UploadFile = File(..., description="PDF or DOCX resume"),
+    job_description: str | None = Form(default=None),
+):
+    """Canonical Smart Resume Analyzer endpoint (full 5-technology pipeline)."""
+    return await _analyze_impl(file, job_description)
+
+
+class PredictRoleBody(BaseModel):
+    resume_text: str = Field(min_length=20, max_length=50000)
+    skills: list[str] | None = None
+
+
+class MatchJobBody(BaseModel):
+    resume_text: str = Field(min_length=20, max_length=50000)
+    job_description: str = Field(min_length=20, max_length=50000)
+    resume_skills: list[str] | None = None
+    job_skills: list[str] | None = None
+
+
+class SkillsBody(BaseModel):
+    resume_text: str = Field(min_length=20, max_length=50000)
+    job_description: str | None = None
+
+
+class RoadmapBody(BaseModel):
+    resume: dict[str, Any] = Field(default_factory=dict)
+    role_prediction: dict[str, Any] = Field(default_factory=dict)
+    semantic_analysis: dict[str, Any] = Field(default_factory=dict)
+    ats_analysis: dict[str, Any] = Field(default_factory=dict)
+    job_description: str | None = None
+
+
+@app.post("/api/predict-role")
+def api_predict_role(body: PredictRoleBody):
+    """TF-IDF + Logistic Regression fallback role prediction."""
+    try:
+        from services.role_classifier import predict_role
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Classifier import failed: {exc}")
+    return predict_role(body.resume_text, body.skills)
+
+
+@app.post("/api/match-job")
+def api_match_job(body: MatchJobBody):
+    """Sentence Transformers + Cosine Similarity resume/JD matching."""
+    try:
+        from services.similarity_engine import semantic_job_analysis
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Similarity engine import failed: {exc}")
+    return semantic_job_analysis(
+        body.resume_text,
+        body.job_description,
+        body.resume_skills,
+        body.job_skills,
+    )
+
+
+@app.post("/api/analyze-skills")
+def api_analyze_skills(body: SkillsBody):
+    """NLP skill extraction + optional semantic gap vs a job description."""
+    try:
+        from services.resume_parser import parse_resume_structured
+        from services.similarity_engine import skill_gap_analysis
+        from skills import extract_professional_skills, detect_domain
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    parsed = parse_resume_structured(body.resume_text)
+    job_skills = []
+    if body.job_description:
+        domain = detect_domain(body.job_description)
+        job_skills = extract_professional_skills(body.job_description, domain)
+    gap = skill_gap_analysis(parsed.get("skills") or [], job_skills, body.resume_text, body.job_description or "")
+    return {"resume_skills": parsed.get("skills"), "job_skills": job_skills, **gap}
+
+
+@app.post("/api/generate-roadmap")
+def api_generate_roadmap(body: RoadmapBody):
+    """Gemini (or heuristic) roadmap / milestones from structured pipeline outputs."""
+    try:
+        from services.gemini_service import run_gemini_intelligence
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return run_gemini_intelligence(
+        body.resume,
+        body.role_prediction,
+        body.semantic_analysis,
+        body.ats_analysis,
+        body.job_description,
+    )
 
 
 _provider = jobs_provider_status()
